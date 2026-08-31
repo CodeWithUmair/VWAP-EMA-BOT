@@ -1,0 +1,12 @@
+# Requirements for XAU/USD Triple Filter Scalper Desktop Bot
+# Compatible with Python 3.9+
+
+pandas>=2.0.0
+numpy>=1.24.0
+streamlit>=1.30.0
+MetaTrader5>=5.0.45; sys_platform == 'win32'
+plotly>=5.18.0
+scipy>=1.11.0
+pytest>=7.4.0
+requests>=2.31.0
+python-dotenv>=1.0.0
