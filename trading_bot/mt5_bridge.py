@@ -1,341 +1,349 @@
 """
-MetaTrader 5 Bridge for Live Market Data and Order Execution.
-Supports real Windows MetaTrader 5 and mock fallback for non-Windows environments.
+MetaTrader5 Connector & Execution Bridge.
+
+Features:
+1. Native MT5 Integration on Windows systems with terminal installed.
+2. Realistic Simulation Mode Fallback for testing, backtesting, and development on non-Windows/Linux.
+3. Strict Pre-Trade Verification on EVERY order attempt:
+   - Queries account_info().trade_mode == ACCOUNT_TRADE_MODE_DEMO (refuses LIVE accounts).
+   - Checks terminal_info().trade_allowed (AlgoTrading toggle).
+   - Enforces unique Magic Number tagging on all orders.
+   - Queries exact broker spread and point values via symbol_info().
 """
 
 import os
 import sys
 import time
-from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import List, Dict, Any, Optional, Tuple
 
+# Try importing native MetaTrader5 if available (Windows)
 try:
     import MetaTrader5 as mt5
     MT5_AVAILABLE = True
-    HAS_MT5 = True
-except (ImportError, Exception):
-    mt5 = None
+except ImportError:
     MT5_AVAILABLE = False
-    HAS_MT5 = False
-
-
-@dataclass
-class BarData:
-    time: int
-    open: float
-    high: float
-    low: float
-    close: float
-    tick_volume: int
-
-
-@dataclass
-class SymbolInfo:
-    symbol: str
-    bid: float
-    ask: float
-    spread_usd: float
-    point: float
-    digits: int
+    mt5 = None
 
 
 @dataclass
 class AccountInfo:
+    """Standardized account information."""
     login: int
-    trade_mode: str
+    trade_mode: str  # "DEMO", "REAL", "CONTEST"
+    is_demo: bool
     balance: float
     equity: float
     margin: float
     free_margin: float
+    leverage: int
     currency: str
     server: str
-    is_demo: bool
+    company: str
+
+
+@dataclass
+class SymbolInfo:
+    """Standardized symbol specifications."""
+    name: str
+    bid: float
+    ask: float
+    spread_points: float
+    spread_usd: float
+    point: float
+    digits: int
+    volume_min: float
+    volume_max: float
+    volume_step: float
+    trade_contract_size: float
 
 
 class MT5Bridge:
-    def __init__(self, symbol: str = "XAUUSDm", timeframe: int = 1):
+    """Bridge for interacting with MetaTrader5 or Simulation Engine."""
+
+    def __init__(self, magic_number: int = 9212001, symbol: str = "XAUUSD"):
+        self.magic_number = magic_number
         self.symbol = symbol
-        self.timeframe = timeframe
         self.is_connected = False
         self.is_simulation = not MT5_AVAILABLE
+        self.sim_balance = 10000.0
+        self.sim_equity = 10000.0
+        self.sim_positions: Dict[int, Dict[str, Any]] = {}
+        self.ticket_counter = 5000000
 
-    def connect(self, login: Optional[int] = None, password: Optional[str] = None, server: Optional[str] = None) -> bool:
-        """Connects to MT5 terminal."""
-        if not HAS_MT5:
-            print("[INFO] MetaTrader5 package not available. Running in simulated fallback mode.")
+    def connect(self, path: Optional[str] = None) -> Tuple[bool, str]:
+        """Initializes connection to MetaTrader5 terminal."""
+        if not MT5_AVAILABLE:
             self.is_connected = True
-            return True
+            self.is_simulation = True
+            return True, "Running in High-Fidelity Simulation Mode (Native MT5 requires Windows + MT5 Terminal)"
 
-        if not mt5.initialize():
-            print(f"[ERROR] MT5 initialize failed: {mt5.last_error()}")
-            self.is_connected = False
-            return False
+        try:
+            init_kwargs = {}
+            if path:
+                init_kwargs["path"] = path
 
-        if login and password and server:
-            authorized = mt5.login(login=login, password=password, server=server)
-            if not authorized:
-                print(f"[ERROR] MT5 login failed: {mt5.last_error()}")
+            if not mt5.initialize(**init_kwargs):
+                err = mt5.last_error()
                 self.is_connected = False
-                return False
+                return False, f"MT5 initialization failed: {err}"
 
-        self.is_connected = True
-        # Ensure target symbol is selected
-        mt5.symbol_select(self.symbol, True)
-        print(f"[SUCCESS] Connected to MetaTrader 5. Target symbol: {self.symbol}")
-        return True
+            self.is_connected = True
+            self.is_simulation = False
+            return True, "Connected to MetaTrader 5 Terminal successfully"
+        except Exception as e:
+            self.is_connected = False
+            return False, f"Exception connecting to MT5: {str(e)}"
 
     def disconnect(self):
         """Shuts down MT5 connection."""
-        if HAS_MT5 and self.is_connected:
+        if MT5_AVAILABLE and self.is_connected and not self.is_simulation:
             mt5.shutdown()
         self.is_connected = False
 
-    def get_symbol_info(self, symbol: Optional[str] = None) -> SymbolInfo:
-        """Retrieves real-time bid, ask, and spread from MT5."""
-        sym = symbol or self.symbol
-        if not self.is_connected or not HAS_MT5:
-            return SymbolInfo(
-                symbol=sym, bid=4432.35, ask=4432.61,
-                spread_usd=0.26, point=0.01, digits=2
-            )
-
-        # Make sure symbol is selected in Market Watch
-        if not mt5.symbol_select(sym, True):
-            for alt in ["XAUUSDm", "XAUUSD", "GOLD", "XAUUSD.m", "XAUUSD_i"]:
-                if mt5.symbol_select(alt, True):
-                    sym = alt
-                    self.symbol = alt
-                    break
-
-        info = mt5.symbol_info(sym)
-        if info is None:
-            return SymbolInfo(
-                symbol=sym, bid=4432.35, ask=4432.61,
-                spread_usd=0.26, point=0.01, digits=2
-            )
-
-        tick = mt5.symbol_info_tick(sym)
-        bid = tick.bid if tick and tick.bid > 0 else info.bid
-        ask = tick.ask if tick and tick.ask > 0 else info.ask
-        spread_usd = round(ask - bid, info.digits or 2)
-
-        return SymbolInfo(
-            symbol=sym,
-            bid=bid,
-            ask=ask,
-            spread_usd=spread_usd,
-            point=info.point,
-            digits=info.digits
-        )
-
-    def get_rates(self, count: int = 150, symbol: Optional[str] = None) -> List[BarData]:
-        """
-        Retrieves real-time candlestick data (M1) from live MT5 terminal.
-        """
-        sym = symbol or self.symbol
-        if not self.is_connected or not HAS_MT5:
-            return self._generate_simulated_rates(count)
-
-        mt5.symbol_select(sym, True)
-        rates = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_M1, 0, count)
-
-        if rates is None or len(rates) == 0:
-            print(f"[WARNING] MT5 returned 0 rates for {sym}, error: {mt5.last_error()}")
-            return self._generate_simulated_rates(count)
-
-        bars = []
-        for r in rates:
-            bars.append(
-                BarData(
-                    time=int(r['time']),
-                    open=float(r['open']),
-                    high=float(r['high']),
-                    low=float(r['low']),
-                    close=float(r['close']),
-                    tick_volume=int(r['tick_volume'])
-                )
-            )
-        return bars
-
     def get_account_info(self) -> AccountInfo:
-        """Retrieves live account balance and demo verification."""
-        if not self.is_connected or not HAS_MT5:
+        """
+        Fetches live account info.
+        CRITICAL: Re-reads trade_mode on EVERY call directly from terminal.
+        """
+        if self.is_simulation or not MT5_AVAILABLE or not self.is_connected:
             return AccountInfo(
-                login=9928120, trade_mode="DEMO", balance=10000.0,
-                equity=10000.0, margin=0.0, free_margin=10000.0,
-                currency="USD", server="Exness-Demo", is_demo=True
+                login=99887766,
+                trade_mode="DEMO",
+                is_demo=True,
+                balance=self.sim_balance,
+                equity=self.sim_equity,
+                margin=0.0,
+                free_margin=self.sim_balance,
+                leverage=100,
+                currency="USD",
+                server="MetaQuotes-Demo",
+                company="MetaQuotes Software Corp."
             )
 
         acc = mt5.account_info()
         if acc is None:
-            return AccountInfo(
-                login=0, trade_mode="UNKNOWN", balance=0.0,
-                equity=0.0, margin=0.0, free_margin=0.0,
-                currency="USD", server="Unknown", is_demo=False
-            )
+            raise RuntimeError(f"Failed to get account info from MT5: {mt5.last_error()}")
 
         is_demo = (acc.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO)
-        mode_str = "DEMO" if is_demo else "LIVE"
+        mode_str = "DEMO" if is_demo else ("REAL" if acc.trade_mode == mt5.ACCOUNT_TRADE_MODE_REAL else "CONTEST")
 
         return AccountInfo(
             login=acc.login,
             trade_mode=mode_str,
+            is_demo=is_demo,
             balance=acc.balance,
             equity=acc.equity,
             margin=acc.margin,
             free_margin=acc.margin_free,
+            leverage=acc.leverage,
             currency=acc.currency,
             server=acc.server,
-            is_demo=is_demo
+            company=acc.company
         )
 
-    def is_algo_trading_allowed(self) -> bool:
-        """Verifies MT5 terminal automated trading toggle."""
-        if not HAS_MT5 or not self.is_connected:
-            return True
-        term_info = mt5.terminal_info()
-        return term_info.trade_allowed if term_info else False
-
-    # Alias taake dono naamo se call ho sake
     def is_algo_trading_enabled(self) -> bool:
-        return self.is_algo_trading_allowed()
+        """Checks if AlgoTrading toggle in MT5 terminal is active."""
+        if self.is_simulation or not MT5_AVAILABLE or not self.is_connected:
+            return True
+
+        term = mt5.terminal_info()
+        if term is None:
+            return False
+        return bool(term.trade_allowed)
+
+    def get_symbol_info(self, symbol: Optional[str] = None) -> SymbolInfo:
+        """Fetches symbol specs and live spread."""
+        sym = symbol or self.symbol
+
+        if self.is_simulation or not MT5_AVAILABLE or not self.is_connected:
+            # Default realistic Gold specs: Bid ~ 2380.50, Ask ~ 2380.75 (0.25 spread)
+            return SymbolInfo(
+                name=sym,
+                bid=2380.50,
+                ask=2380.75,
+                spread_points=25,
+                spread_usd=0.25,
+                point=0.01,
+                digits=2,
+                volume_min=0.01,
+                volume_max=100.0,
+                volume_step=0.01,
+                trade_contract_size=100.0
+            )
+
+        info = mt5.symbol_info(sym)
+        if info is None:
+            raise RuntimeError(f"Symbol {sym} not found in MT5: {mt5.last_error()}")
+
+        if not info.visible:
+            mt5.symbol_select(sym, True)
+            info = mt5.symbol_info(sym)
+
+        spread_usd = info.spread * info.point
+        return SymbolInfo(
+            name=info.name,
+            bid=info.bid,
+            ask=info.ask,
+            spread_points=float(info.spread),
+            spread_usd=round(spread_usd, 2),
+            point=info.point,
+            digits=info.digits,
+            volume_min=info.volume_min,
+            volume_max=info.volume_max,
+            volume_step=info.volume_step,
+            trade_contract_size=info.trade_contract_size
+        )
+
+    def get_rates(self, symbol: Optional[str] = None, count: int = 150) -> Any:
+        """
+        Fetches rates and returns them in named bar format or dict format compatible with Streamlit app.
+        """
+        bars_dict = self.fetch_recent_bars(symbol=symbol, count=count)
+        
+        class BarObj:
+            def __init__(self, time_val, o, h, l, c, v):
+                self.time = time_val
+                self.open = o
+                self.high = h
+                self.low = l
+                self.close = c
+                self.tick_volume = v
+
+        return [
+            BarObj(
+                bars_dict["times"][i],
+                bars_dict["opens"][i],
+                bars_dict["highs"][i],
+                bars_dict["lows"][i],
+                bars_dict["closes"][i],
+                bars_dict["volumes"][i]
+            )
+            for i in range(len(bars_dict["closes"]))
+        ]
+
+    def fetch_recent_bars(self, symbol: Optional[str] = None, count: int = 300) -> Dict[str, List]:
+        """Fetches recent 1-minute OHLCV bars."""
+        sym = symbol or self.symbol
+
+        if self.is_simulation or not MT5_AVAILABLE or not self.is_connected:
+            from trading_bot.data_feed import generate_realistic_gold_data
+            return generate_realistic_gold_data(num_bars=count)
+
+        rates = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_M1, 0, count)
+        if rates is None or len(rates) == 0:
+            raise RuntimeError(f"Failed to fetch rates for {sym}: {mt5.last_error()}")
+
+        times = [datetime.fromtimestamp(r['time'], tz=timezone.utc).isoformat() for r in rates]
+        opens = [float(r['open']) for r in rates]
+        highs = [float(r['high']) for r in rates]
+        lows = [float(r['low']) for r in rates]
+        closes = [float(r['close']) for r in rates]
+        volumes = [float(r['tick_volume']) for r in rates]
+
+        return {
+            "times": times,
+            "opens": opens,
+            "highs": highs,
+            "lows": lows,
+            "closes": closes,
+            "volumes": volumes
+        }
 
     def send_order(
         self,
-        direction: str,
+        direction: str,  # "BUY" or "SELL"
         volume: float,
-        sl_price: float,
-        tp_price: float,
-        magic_number: int = 9212001,
-        comment: str = "EMA_VWAP_Scalper"
-    ) -> Tuple[bool, Optional[int], str]:
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+        sl_price: Optional[float] = None,
+        tp_price: Optional[float] = None,
+        magic_number: Optional[int] = None,
+        comment: str = "TripleFilter_Scalper"
+    ) -> Tuple[bool, int, str]:
         """
-        Dispatches causal order with properly rounded SL and TP to MT5.
-        Auto-detects broker filling mode and validates minimum stop distances.
+        Sends an order with rigorous safety checks. Supports both stop_loss/take_profit and sl_price/tp_price kwargs.
+        Always returns a 3-tuple (bool, int, str).
         """
-        if not self.is_connected or not HAS_MT5:
-            ticket = 12345678
-            msg = f"Simulated {direction} order of {volume} lots executed at market with SL=${sl_price:.2f}, TP=${tp_price:.2f}"
-            return True, ticket, msg
+        try:
+            sl = stop_loss if stop_loss is not None else (sl_price or 0.0)
+            tp = take_profit if take_profit is not None else (tp_price or 0.0)
+            magic = magic_number if magic_number is not None else self.magic_number
 
-        sym = self.symbol
-        mt5.symbol_select(sym, True)
-        info = mt5.symbol_info(sym)
-        tick = mt5.symbol_info_tick(sym)
+            # Safety Check 1: DEMO Verification
+            acc = self.get_account_info()
+            if not acc.is_demo:
+                return False, 0, "ORDER REFUSED: Account is LIVE. Trading bot is restricted to DEMO accounts only."
 
-        if info is None or tick is None:
-            return False, None, f"Could not get tick info for {sym}"
+            # Safety Check 2: AlgoTrading enabled
+            if not self.is_algo_trading_enabled():
+                return False, 0, "ORDER REFUSED: AlgoTrading is disabled in MetaTrader5."
 
-        digits = info.digits if info.digits is not None else 2
-        point = info.point if info.point is not None else 0.01
-        is_buy = (direction.upper() == "BUY")
-        
-        price = tick.ask if is_buy else tick.bid
-        price = round(price, digits)
+            sym_info = self.get_symbol_info()
 
-        # Minimum stop distance calculation ($1.00 min distance on gold)
-        min_stop_dist = max(1.0, 100 * point)
+            if self.is_simulation or not MT5_AVAILABLE or not self.is_connected:
+                # Simulate fill
+                self.ticket_counter += 1
+                ticket = self.ticket_counter
+                fill_price = sym_info.ask if direction == "BUY" else sym_info.bid
+                self.sim_positions[ticket] = {
+                    "ticket": ticket,
+                    "direction": direction,
+                    "volume": volume,
+                    "entry_price": fill_price,
+                    "stop_loss": round(sl, 2),
+                    "take_profit": round(tp, 2),
+                    "open_time": datetime.now(timezone.utc).isoformat(),
+                    "magic": magic,
+                    "comment": comment
+                }
+                return True, ticket, f"Simulated {direction} order {ticket} filled at ${fill_price:.2f} (SL: ${sl:.2f}, TP: ${tp:.2f})"
 
-        # Validate SL / TP
-        if is_buy:
-            if sl_price <= 0 or sl_price >= price:
-                sl_price = price - max(2.5, min_stop_dist)
-            if tp_price <= 0 or tp_price <= price:
-                tp_price = price + max(3.75, min_stop_dist * 1.5)
-        else:
-            if sl_price <= 0 or sl_price <= price:
-                sl_price = price + max(2.5, min_stop_dist)
-            if tp_price <= 0 or tp_price >= price:
-                tp_price = price - max(3.75, min_stop_dist * 1.5)
+            # Real MT5 Order Execution
+            order_type = mt5.ORDER_TYPE_BUY if direction == "BUY" else mt5.ORDER_TYPE_SELL
+            price = sym_info.ask if direction == "BUY" else sym_info.bid
+            
+            # Round stops to digits
+            sl_rounded = round(sl, sym_info.digits) if sl > 0 else 0.0
+            tp_rounded = round(tp, sym_info.digits) if tp > 0 else 0.0
 
-        sl_price = round(sl_price, digits)
-        tp_price = round(tp_price, digits)
+            # Auto-detect supported filling mode
+            filling_mode = mt5.ORDER_FILLING_IOC
+            if hasattr(mt5, "symbol_info") and sym_info:
+                raw_sym = mt5.symbol_info(self.symbol)
+                if raw_sym and hasattr(raw_sym, "filling_mode"):
+                    if raw_sym.filling_mode & 1:  # FOK
+                        filling_mode = mt5.ORDER_FILLING_FOK
+                    elif raw_sym.filling_mode & 2:  # IOC
+                        filling_mode = mt5.ORDER_FILLING_IOC
+                    else:
+                        filling_mode = mt5.ORDER_FILLING_RETURN
 
-        # Auto-detect broker filling mode
-        filling_type = mt5.ORDER_FILLING_FOK
-        if hasattr(info, 'filling_mode'):
-            if info.filling_mode & mt5.ORDER_FILLING_IOC:
-                filling_type = mt5.ORDER_FILLING_IOC
-            elif info.filling_mode & mt5.ORDER_FILLING_FOK:
-                filling_type = mt5.ORDER_FILLING_FOK
-            else:
-                filling_type = mt5.ORDER_FILLING_RETURN
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": self.symbol,
+                "volume": float(volume),
+                "type": order_type,
+                "price": float(price),
+                "sl": float(sl_rounded),
+                "tp": float(tp_rounded),
+                "deviation": 20,  # Max 20 points slippage tolerance
+                "magic": int(magic),
+                "comment": comment,
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": filling_mode,
+            }
 
-        request = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": sym,
-            "volume": float(volume),
-            "type": mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL,
-            "price": float(price),
-            "sl": float(sl_price),
-            "tp": float(tp_price),
-            "deviation": 50,
-            "magic": int(magic_number),
-            "comment": comment,
-            "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": filling_type,
-        }
-        
-    def get_closed_deals(self, from_timestamp: int) -> List[Dict[str, Any]]:
-        """
-        Fetches closed deals from MT5 history since a given timestamp.
-        """
-        if not self.is_connected or not HAS_MT5:
-            return []
+            result = mt5.order_send(request)
+            if result is None:
+                err_msg = mt5.last_error() if hasattr(mt5, "last_error") else "Unknown MT5 error"
+                return False, 0, f"order_send returned None: {err_msg}"
 
-        from_date = datetime.fromtimestamp(from_timestamp, tz=timezone.utc)
-        to_date = datetime.now(timezone.utc)
+            if result.retcode != mt5.TRADE_RETCODE_DONE:
+                return False, 0, f"Order rejected (retcode {result.retcode}): {result.comment}"
 
-        deals = mt5.history_deals_get(from_date, to_date)
-        if deals is None or len(deals) == 0:
-            return []
+            return True, result.order, f"Order {result.order} executed successfully at {result.price} (SL: {sl_rounded}, TP: {tp_rounded})"
 
-        closed_list = []
-        for d in deals:
-            # Entry 1 = OUT (Deal closing a position)
-            if d.entry == mt5.DEAL_ENTRY_OUT or d.entry == 1:
-                closed_list.append({
-                    "ticket": d.order,
-                    "deal_id": d.ticket,
-                    "symbol": d.symbol,
-                    "profit": float(d.profit),
-                    "commission": float(d.commission),
-                    "swap": float(d.swap),
-                    "close_price": float(d.price),
-                    "volume": float(d.volume),
-                    "close_time": datetime.fromtimestamp(d.time, tz=timezone.utc).isoformat(),
-                    "magic": d.magic,
-                    "comment": d.comment
-                })
-        return closed_list
-
-
-
-
-        result = mt5.order_send(request)
-        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-            ret_code = result.retcode if result else mt5.last_error()
-            comment_err = result.comment if result else ""
-            err_msg = f"Order failed. MT5 Retcode: {ret_code} ({comment_err})"
-            print(f"[ERROR] {err_msg} | Request: Price={price}, SL={sl_price}, TP={tp_price}, Fill={filling_type}")
-            return False, None, err_msg
-
-        success_msg = f"Order #{result.order} EXECUTED: {direction} {result.volume} lots at ${result.price:.2f} (SL: ${sl_price:.2f}, TP: ${tp_price:.2f})"
-        print(f"[SUCCESS] {success_msg}")
-        return True, result.order, success_msg
-
-
-    def _generate_simulated_rates(self, count: int) -> List[BarData]:
-        """Fallback rates generator matching current gold price."""
-        now = int(time.time())
-        bars = []
-        base_price = 4432.00
-        for i in range(count):
-            t = now - (count - i) * 60
-            o = base_price + ((i % 10) - 5) * 0.2
-            h = o + 0.4
-            l = o - 0.3
-            c = (o + h + l) / 3
-            bars.append(BarData(time=t, open=o, high=h, low=l, close=c, tick_volume=100))
-        return bars
+        except Exception as e:
+            return False, 0, f"Order dispatch exception: {str(e)}"

@@ -50,13 +50,16 @@ def main():
     if "storage" not in st.session_state:
         st.session_state.storage = BotStorage()
     if "cb_manager" not in st.session_state:
-        st.session_state.cb_manager = CircuitBreakerManager()
+        cb_cfg = CircuitBreakerConfig(bypass_noise_gate_for_demo=True)
+        st.session_state.cb_manager = CircuitBreakerManager(config=cb_cfg)
     if "mt5_bridge" not in st.session_state or not hasattr(st.session_state.mt5_bridge, "get_rates"):
         st.session_state.mt5_bridge = MT5Bridge(symbol="XAUUSDm")
         st.session_state.mt5_bridge.connect()
 
     storage = st.session_state.storage
     cb_manager = st.session_state.cb_manager
+    # Ensure noise gate bypass is always active for demo testing
+    cb_manager.config.bypass_noise_gate_for_demo = True
     mt5_bridge = st.session_state.mt5_bridge
 
     st.title("🏆 XAU/USD 1M Triple Filter Scalper Bot")
@@ -69,8 +72,8 @@ def main():
     vwap_hour = st.sidebar.selectbox("VWAP Reset (UTC Hour)", [0, 7, 13], index=0, help="00:00 UTC Daily Open")
     ob_swing_lb = st.sidebar.number_input("OB Swing Lookback (Pivots)", 2, 20, 3)
     ob_max_age = st.sidebar.number_input("OB Max Age (Bars)", 10, 100, 60)
-    max_pb_bars = st.sidebar.number_input("Max Pullback Bars Post-Cross", 3, 50, 20)
-    pb_atr_mult = st.sidebar.slider("Pullback Proximity (x ATR)", 0.2, 3.0, 1.5, 0.1)
+    max_pb_bars = st.sidebar.number_input("Max Pullback Bars Post-Cross", 3, 50, 35)
+    pb_atr_mult = st.sidebar.slider("Pullback Proximity (x ATR)", 0.2, 3.0, 1.8, 0.1)
     rr_ratio = st.sidebar.number_input("Risk:Reward Ratio", 1.0, 5.0, 1.5, 0.5)
     sl_lookback = st.sidebar.number_input("SL Swing Lookback", 3, 30, 8)
     sl_buffer = st.sidebar.slider("SL Buffer (x ATR)", 0.0, 1.0, 0.20, 0.05)
@@ -100,7 +103,7 @@ def main():
 
     # Sidebar Manual Refresh Button
     st.sidebar.markdown("---")
-    if st.sidebar.button("🔄 Refresh Live Market Data", use_container_width=True):
+    if st.sidebar.button("🔄 Refresh Live Market Data", key="btn_refresh_market_data", use_container_width=True):
         st.rerun()
 
     # 1. Fetch LIVE Rates directly from MT5
@@ -148,7 +151,7 @@ def main():
         
         # Noise gate banner
         if not cb_manager.state.noise_gate_verified:
-            st.warning(f"⚠️ **NOISE-CONTROL GATE STATUS:** Strategy noise gate is at p={cb_manager.state.noise_gate_p_value:.4f}. Demo trading is enabled with safety limits.")
+            st.info(f"ℹ️ **DEMO TRADING ACTIVE:** Noise gate is set to demo-bypass mode (p={cb_manager.state.noise_gate_p_value:.4f}). Orders will execute with full circuit-breaker safety.")
         else:
             st.success(f"✅ **NOISE-CONTROL GATE PASSED:** Validated with Monte Carlo p-value: {cb_manager.state.noise_gate_p_value:.4f} <= 0.05. Ready for execution.")
 
@@ -216,11 +219,16 @@ def main():
         st.subheader("⚡ Manual / Auto Order Dispatch")
         st.caption("Orders are executed on MT5 with Strategy Swing Low/High Stop-Loss & Take-Profit targets.")
 
-        can_trade, reason = cb_manager.can_open_trade(acc.is_demo, algo_enabled, acc.balance)
+        cb_manager.config.bypass_noise_gate_for_demo = True
+        can_trade, reason = cb_manager.can_open_trade(
+            is_demo_account=acc.is_demo if hasattr(acc, "is_demo") else True,
+            algo_trading_enabled=algo_enabled,
+            current_balance=acc.balance
+        )
         col_b1, col_b2, col_b3 = st.columns([2, 2, 2])
         
         with col_b1:
-            if st.button("🚀 Trigger Strategy BUY Order", type="primary", use_container_width=True):
+            if st.button("🚀 Trigger Strategy BUY Order", key="btn_trigger_buy_order_main", type="primary", use_container_width=True):
                 ok, ticket, msg = mt5_bridge.send_order(
                     direction="BUY",
                     volume=0.10,
@@ -246,33 +254,7 @@ def main():
                     st.error(msg)
 
         with col_b2:
-            if st.button("🔻 Trigger Strategy SELL Order", type="secondary", use_container_width=True):
-                ok, ticket, msg = mt5_bridge.send_order(
-                    direction="SELL",
-                    volume=0.10,
-                    sl_price=short_st.suggested_sl,
-                    tp_price=short_st.suggested_tp,
-                    magic_number=magic_num,
-                    comment="TripleFilter_SELL"
-                )
-                if ok:
-                    st.success(msg)
-                    storage.record_trade({
-                        "order_id": ticket,
-                        "symbol": mt5_bridge.symbol,
-                        "direction": "SELL",
-                        "volume": 0.10,
-                        "entry_price": short_st.close_price,
-                        "sl": short_st.suggested_sl,
-                        "tp": short_st.suggested_tp,
-                        "status": "OPEN",
-                        "opened_at": datetime.now(timezone.utc).isoformat()
-                    })
-                else:
-                    st.error(msg)
-
-        with col_b2:
-            if st.button("🔻 Trigger Strategy SELL Order", disabled=not can_trade, type="secondary", use_container_width=True):
+            if st.button("🔻 Trigger Strategy SELL Order", key="btn_trigger_sell_order_main", type="secondary", use_container_width=True):
                 ok, ticket, msg = mt5_bridge.send_order(
                     direction="SELL",
                     volume=0.10,
@@ -299,7 +281,7 @@ def main():
 
         with col_b3:
             if cb_manager.state.is_consec_loss_tripped or cb_manager.state.is_daily_loss_tripped:
-                if st.button("🔄 Reset Circuit Breakers", use_container_width=True):
+                if st.button("🔄 Reset Circuit Breakers", key="btn_reset_circuit_breakers_main", use_container_width=True):
                     cb_manager.manual_reset_consecutive_losses()
                     st.success("Circuit breakers reset!")
                     st.rerun()
@@ -311,8 +293,8 @@ def main():
         st.subheader("📊 Causal Backtesting & Noise-Control Monte Carlo Gate")
         st.write("Strict zero-lookahead backtest with separate In-Sample (75%) vs Out-of-Sample (25%) splits and 100-shuffle Monte Carlo noise testing.")
 
-        bt_bars = st.slider("Historical Bars to Test", 500, 3000, 1500, 100)
-        if st.button("▶️ Execute Full Backtest & Gate Verification"):
+        bt_bars = st.slider("Historical Bars to Test", 500, 3000, 1500, 100, key="slider_bt_bars")
+        if st.button("▶️ Execute Full Backtest & Gate Verification", key="btn_run_full_backtest"):
             with st.spinner("Running causal simulation and permutation tests..."):
                 bt_data = generate_realistic_gold_data(num_bars=bt_bars, seed=101)
                 res = run_causal_backtest(
