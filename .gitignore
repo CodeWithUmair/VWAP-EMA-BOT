@@ -1,0 +1,13 @@
+# Added 2026-09-01 alongside the handoff (repo had no .gitignore).
+# Does not un-track files already committed upstream (e.g. trading_bot/__pycache__/*.pyc,
+# trading_bot_data.sqlite) — it only stops new local noise from being committed.
+
+venv/
+.venv/
+__pycache__/
+*.pyc
+.env
+*.log
+
+# per-account SQLite files if you run the multi-account setup
+acct*.sqlite
