@@ -351,3 +351,80 @@ class MT5Bridge:
 
         except Exception as e:
             return False, 0, f"Order dispatch exception: {str(e)}"
+
+    def get_open_positions(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Returns all open positions for the target symbol."""
+        sym = symbol or self.symbol
+        if self.is_simulation or not MT5_AVAILABLE or not self.is_connected:
+            return list(self.sim_positions.values())
+
+        positions = mt5.positions_get(symbol=sym)
+        if positions is None:
+            return []
+
+        res = []
+        for pos in positions:
+            res.append({
+                "ticket": pos.ticket,
+                "symbol": pos.symbol,
+                "direction": "BUY" if pos.type == mt5.ORDER_TYPE_BUY else "SELL",
+                "volume": pos.volume,
+                "entry_price": pos.price_open,
+                "current_price": pos.price_current,
+                "sl": pos.sl,
+                "tp": pos.tp,
+                "profit": pos.profit,
+                "magic": pos.magic,
+                "comment": pos.comment,
+                "open_time": datetime.fromtimestamp(pos.time, tz=timezone.utc).isoformat()
+            })
+        return res
+
+    def get_closed_deals(self, from_timestamp: int) -> List[Dict[str, Any]]:
+        """Fetches closed trade deals since from_timestamp."""
+        if self.is_simulation or not MT5_AVAILABLE or not self.is_connected:
+            return []
+
+        from_dt = datetime.fromtimestamp(from_timestamp, tz=timezone.utc)
+        to_dt = datetime.now(timezone.utc)
+        deals = mt5.history_deals_get(from_dt, to_dt)
+        if deals is None:
+            return []
+
+        closed = []
+        for d in deals:
+            # Entry out means closed position
+            if d.entry == 1 or d.entry == mt5.DEAL_ENTRY_OUT:
+                closed.append({
+                    "ticket": d.position_id,
+                    "order": d.order,
+                    "symbol": d.symbol,
+                    "profit": float(d.profit),
+                    "close_price": float(d.price),
+                    "volume": float(d.volume),
+                    "time": datetime.fromtimestamp(d.time, tz=timezone.utc).isoformat()
+                })
+        return closed
+
+    def modify_position_sl(self, ticket: int, new_sl: float) -> bool:
+        """Modifies Stop Loss of an active position (e.g., for Break-Even)."""
+        if self.is_simulation or not MT5_AVAILABLE or not self.is_connected:
+            if ticket in self.sim_positions:
+                self.sim_positions[ticket]["stop_loss"] = new_sl
+                return True
+            return False
+
+        pos = mt5.positions_get(ticket=ticket)
+        if not pos:
+            return False
+
+        p = pos[0]
+        request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "position": ticket,
+            "symbol": p.symbol,
+            "sl": float(round(new_sl, 2)),
+            "tp": float(p.tp),
+        }
+        res = mt5.order_send(request)
+        return res is not None and res.retcode == mt5.TRADE_RETCODE_DONE
