@@ -1,6 +1,5 @@
 """
-Autonomous Live Execution Engine for MT5.
-Scans market continuously on every 3 seconds and executes trades autonomously.
+Autonomous Live Execution Engine for MT5 with Real-Time Filter Diagnostics.
 """
 
 import time
@@ -24,33 +23,40 @@ from trading_bot.storage import BotStorage
 
 
 def run_live_auto_trading():
-    print("=" * 70)
-    print("🚀 STARTING AUTONOMOUS LIVE SCALPER ENGINE (XAUUSDm M1)")
-    print("=" * 70)
+    print("=" * 75, flush=True)
+    print("🚀 STARTING AUTONOMOUS LIVE SCALPER ENGINE (XAUUSDm M1)", flush=True)
+    print("=" * 75, flush=True)
 
-    # 1. Initialize Modules
-    params = StrategyParameters()
+    # Balanced Strategy Parameters for Realistic M1 Scalping
+    params = StrategyParameters(
+        max_pullback_bars=35,       # Pullback window increased to 35 bars
+        ob_buffer_atr=0.35,         # Buffer to catch OB zone retests
+        pullback_atr_mult=1.8       # Realistic distance to EMA zone
+    )
+
     cb_config = CircuitBreakerConfig(bypass_noise_gate_for_demo=True)
     cb_manager = CircuitBreakerManager(config=cb_config)
     storage = BotStorage()
     mt5_bridge = MT5Bridge(symbol="XAUUSDm")
 
-    # 2. Connect to MT5
     if not mt5_bridge.connect():
-        print("❌ Could not connect to MetaTrader 5 terminal. Exiting.")
+        print("❌ Could not connect to MetaTrader 5 terminal. Exiting.", flush=True)
         return
 
     acc = mt5_bridge.get_account_info()
-    print(f"✅ Connected to MT5 Account: {acc.login} | Mode: {acc.trade_mode} | Balance: ${acc.balance:,.2f}")
-    print("⚡ Auto-Scanner active. Monitoring live market tick every 3 seconds...\n")
+    print(f"✅ Connected to MT5 Account: {acc.login} | Mode: {acc.trade_mode} | Balance: ${acc.balance:,.2f}", flush=True)
+    print(f"⚡ Target Symbol: {mt5_bridge.symbol} | Algo Allowed: {mt5_bridge.is_algo_trading_allowed()}", flush=True)
+    print("⚡ Auto-Scanner active. Streaming live ticks every 3 seconds...\n", flush=True)
 
     last_evaluated_time = 0
+    iteration = 0
 
     try:
         while True:
-            time.sleep(3)  # Har 3 second baad live scan
+            time.sleep(3)
+            iteration += 1
 
-            # 1. Fetch live rates
+            # 1. Fetch live rates from MT5
             bars = mt5_bridge.get_rates(count=150)
             if not bars or len(bars) < 30:
                 continue
@@ -65,7 +71,7 @@ def run_live_auto_trading():
 
             curr_idx = len(closes) - 1
 
-            # 2. Real-time checklist evaluation on every 3s loop
+            # 2. Evaluate Strategy Checklist
             checklist = evaluate_checklist_at_bar(
                 opens, highs, lows, closes, times, volumes, curr_idx, params
             )
@@ -75,37 +81,30 @@ def run_live_auto_trading():
             sym_info = mt5_bridge.get_symbol_info()
             now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
 
-            # 3. Print live heartbeat in terminal (updates in place)
-            print(
-                f"[{now_str} UTC] Gold: ${sym_info.bid:.2f}/${sym_info.ask:.2f} (Spread: ${sym_info.spread_usd:.2f}) | "
-                f"BUY Setup: {'🎯 YES' if long_st.all_passed else '❌ NO'} | "
-                f"SELL Setup: {'🎯 YES' if short_st.all_passed else '❌ NO'}",
-                end="\r"
-            )
+            # 3. Print Detailed Diagnostics on every 1M Candle Close
+            if latest_bar.time != last_evaluated_time:
+                last_evaluated_time = latest_bar.time
 
-            # Check for recently closed trades in MT5 history
+                buy_passed_count = sum([long_st.vwap_pass, long_st.crossover_pass, long_st.ob_pass, long_st.pullback_pass, long_st.confirmation_pass])
+                sell_passed_count = sum([short_st.vwap_pass, short_st.crossover_pass, short_st.ob_pass, short_st.pullback_pass, short_st.confirmation_pass])
+
+                print(
+                    f"\n🕯️ [{now_str} UTC | M1 CLOSE] Price: ${closes[-1]:.2f} (Spread: ${sym_info.spread_usd:.2f})\n"
+                    f"   ├─ 🟢 BUY Setup ({buy_passed_count}/5): VWAP={long_st.vwap_pass} | Cross={long_st.crossover_pass} | OB={long_st.ob_pass} | Pullback={long_st.pullback_pass} | Candle={long_st.confirmation_pass}\n"
+                    f"   └─ 🔴 SELL Setup ({sell_passed_count}/5): VWAP={short_st.vwap_pass} | Cross={short_st.crossover_pass} | OB={short_st.ob_pass} | Pullback={short_st.pullback_pass} | Candle={short_st.confirmation_pass}",
+                    flush=True
+                )
+
+            # 4. Check Closed Deals in MT5 History and Record PnL
             closed_deals = mt5_bridge.get_closed_deals(from_timestamp=int(time.time()) - 3600)
             for deal in closed_deals:
                 ticket = deal["ticket"]
                 pnl = deal["profit"]
                 exit_p = deal["close_price"]
-
-                # Update SQLite & Circuit Breakers
                 storage.update_closed_trade(ticket, exit_p, pnl, exit_reason="MT5 Closed Deal")
                 cb_manager.record_trade_outcome(net_pnl_usd=pnl, current_balance=acc.balance)
-                
-                print(f"\n📊 [TRADE CLOSED] Ticket #{ticket} | Net PnL: ${pnl:+.2f} | Exit Price: ${exit_p:.2f}", flush=True)
 
-            # 4. Print detailed log on every new candle close
-            if latest_bar.time != last_evaluated_time:
-                last_evaluated_time = latest_bar.time
-                print(
-                    f"\n[CANDLE CLOSE {now_str} UTC] Price: ${closes[-1]:.2f} | "
-                    f"EMA9: ${long_st.ema_fast:.2f} | EMA21: ${long_st.ema_slow:.2f} | "
-                    f"VWAP: ${long_st.vwap_value:.2f}"
-                )
-
-            # 5. Check Pre-Trade Safety Guardrails
+            # 5. Check Safety Guardrails
             can_trade, reason = cb_manager.can_open_trade(
                 is_demo_account=acc.is_demo,
                 algo_trading_enabled=mt5_bridge.is_algo_trading_allowed(),
@@ -117,7 +116,7 @@ def run_live_auto_trading():
 
             # ================= EXECUTE BUY ORDER =================
             if long_st.all_passed:
-                print(f"\n🎯 >>> ALL 5 CONDITIONS MET: EXECUTING BUY ORDER AT ${sym_info.ask:.2f} <<<")
+                print(f"\n🎯 >>> ALL 5 CONDITIONS MET: EXECUTING BUY ORDER AT ${sym_info.ask:.2f} <<<", flush=True)
                 ok, ticket, msg = mt5_bridge.send_order(
                     direction="BUY",
                     volume=0.10,
@@ -127,7 +126,7 @@ def run_live_auto_trading():
                     comment="Auto_TripleFilter_BUY"
                 )
                 if ok:
-                    print(f"✅ {msg}\n")
+                    print(f"✅ {msg}\n", flush=True)
                     storage.record_trade({
                         "order_id": ticket,
                         "symbol": mt5_bridge.symbol,
@@ -139,13 +138,13 @@ def run_live_auto_trading():
                         "status": "OPEN",
                         "opened_at": datetime.now(timezone.utc).isoformat()
                     })
-                    time.sleep(60)  # Cooldown taake same candle par multiple orders na lagein
+                    time.sleep(60)
                 else:
-                    print(f"❌ Order Failed: {msg}\n")
+                    print(f"❌ Order Failed: {msg}\n", flush=True)
 
             # ================= EXECUTE SELL ORDER =================
             elif short_st.all_passed:
-                print(f"\n🎯 >>> ALL 5 CONDITIONS MET: EXECUTING SELL ORDER AT ${sym_info.bid:.2f} <<<")
+                print(f"\n🎯 >>> ALL 5 CONDITIONS MET: EXECUTING SELL ORDER AT ${sym_info.bid:.2f} <<<", flush=True)
                 ok, ticket, msg = mt5_bridge.send_order(
                     direction="SELL",
                     volume=0.10,
@@ -155,7 +154,7 @@ def run_live_auto_trading():
                     comment="Auto_TripleFilter_SELL"
                 )
                 if ok:
-                    print(f"✅ {msg}\n")
+                    print(f"✅ {msg}\n", flush=True)
                     storage.record_trade({
                         "order_id": ticket,
                         "symbol": mt5_bridge.symbol,
@@ -167,12 +166,12 @@ def run_live_auto_trading():
                         "status": "OPEN",
                         "opened_at": datetime.now(timezone.utc).isoformat()
                     })
-                    time.sleep(60)  # Cooldown taake same candle par multiple orders na lagein
+                    time.sleep(60)
                 else:
-                    print(f"❌ Order Failed: {msg}\n")
+                    print(f"❌ Order Failed: {msg}\n", flush=True)
 
     except KeyboardInterrupt:
-        print("\n🛑 Auto-trading engine stopped by user.")
+        print("\n🛑 Auto-trading engine stopped by user.", flush=True)
         mt5_bridge.disconnect()
 
 

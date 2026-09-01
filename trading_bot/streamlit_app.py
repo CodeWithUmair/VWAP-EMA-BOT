@@ -220,7 +220,7 @@ def main():
         col_b1, col_b2, col_b3 = st.columns([2, 2, 2])
         
         with col_b1:
-            if st.button("🚀 Trigger Strategy BUY Order", disabled=not can_trade, type="primary", use_container_width=True):
+            if st.button("🚀 Trigger Strategy BUY Order", type="primary", use_container_width=True):
                 ok, ticket, msg = mt5_bridge.send_order(
                     direction="BUY",
                     volume=0.10,
@@ -239,6 +239,32 @@ def main():
                         "entry_price": long_st.close_price,
                         "sl": long_st.suggested_sl,
                         "tp": long_st.suggested_tp,
+                        "status": "OPEN",
+                        "opened_at": datetime.now(timezone.utc).isoformat()
+                    })
+                else:
+                    st.error(msg)
+
+        with col_b2:
+            if st.button("🔻 Trigger Strategy SELL Order", type="secondary", use_container_width=True):
+                ok, ticket, msg = mt5_bridge.send_order(
+                    direction="SELL",
+                    volume=0.10,
+                    sl_price=short_st.suggested_sl,
+                    tp_price=short_st.suggested_tp,
+                    magic_number=magic_num,
+                    comment="TripleFilter_SELL"
+                )
+                if ok:
+                    st.success(msg)
+                    storage.record_trade({
+                        "order_id": ticket,
+                        "symbol": mt5_bridge.symbol,
+                        "direction": "SELL",
+                        "volume": 0.10,
+                        "entry_price": short_st.close_price,
+                        "sl": short_st.suggested_sl,
+                        "tp": short_st.suggested_tp,
                         "status": "OPEN",
                         "opened_at": datetime.now(timezone.utc).isoformat()
                     })
