@@ -44,8 +44,16 @@ def run_live_auto_trading():
         return
 
     acc = mt5_bridge.get_account_info()
+    
+    # Safe check for algo trading capability across all MT5Bridge versions
+    algo_allowed = True
+    if hasattr(mt5_bridge, "is_algo_trading_enabled"):
+        algo_allowed = mt5_bridge.is_algo_trading_enabled()
+    elif hasattr(mt5_bridge, "is_algo_trading_allowed"):
+        algo_allowed = mt5_bridge.is_algo_trading_allowed()
+
     print(f"✅ Connected to MT5 Account: {acc.login} | Mode: {acc.trade_mode} | Balance: ${acc.balance:,.2f}", flush=True)
-    print(f"⚡ Target Symbol: {mt5_bridge.symbol} | Algo Allowed: {mt5_bridge.is_algo_trading_allowed()}", flush=True)
+    print(f"⚡ Target Symbol: {mt5_bridge.symbol} | Algo Allowed: {algo_allowed}", flush=True)
     print("⚡ Auto-Scanner active. Streaming live ticks every 3 seconds...\n", flush=True)
 
     last_evaluated_time = 0
@@ -95,19 +103,26 @@ def run_live_auto_trading():
                     flush=True
                 )
 
-            # 4. Check Closed Deals in MT5 History and Record PnL
-            closed_deals = mt5_bridge.get_closed_deals(from_timestamp=int(time.time()) - 3600)
-            for deal in closed_deals:
-                ticket = deal["ticket"]
-                pnl = deal["profit"]
-                exit_p = deal["close_price"]
-                storage.update_closed_trade(ticket, exit_p, pnl, exit_reason="MT5 Closed Deal")
-                cb_manager.record_trade_outcome(net_pnl_usd=pnl, current_balance=acc.balance)
+            # 4. Check Closed Deals in MT5 History and Record PnL (if method exists)
+            if hasattr(mt5_bridge, "get_closed_deals"):
+                closed_deals = mt5_bridge.get_closed_deals(from_timestamp=int(time.time()) - 3600)
+                for deal in closed_deals:
+                    ticket = deal["ticket"]
+                    pnl = deal["profit"]
+                    exit_p = deal["close_price"]
+                    storage.update_closed_trade(ticket, exit_p, pnl, exit_reason="MT5 Closed Deal")
+                    cb_manager.record_trade_outcome(net_pnl_usd=pnl, current_balance=acc.balance)
 
             # 5. Check Safety Guardrails
+            current_algo_status = True
+            if hasattr(mt5_bridge, "is_algo_trading_enabled"):
+                current_algo_status = mt5_bridge.is_algo_trading_enabled()
+            elif hasattr(mt5_bridge, "is_algo_trading_allowed"):
+                current_algo_status = mt5_bridge.is_algo_trading_allowed()
+
             can_trade, reason = cb_manager.can_open_trade(
                 is_demo_account=acc.is_demo,
-                algo_trading_enabled=mt5_bridge.is_algo_trading_allowed(),
+                algo_trading_enabled=current_algo_status,
                 current_balance=acc.balance
             )
 
@@ -117,7 +132,7 @@ def run_live_auto_trading():
             # ================= EXECUTE BUY ORDER =================
             if long_st.all_passed:
                 print(f"\n🎯 >>> ALL 5 CONDITIONS MET: EXECUTING BUY ORDER AT ${sym_info.ask:.2f} <<<", flush=True)
-                ok, ticket, msg = mt5_bridge.send_order(
+                res = mt5_bridge.send_order(
                     direction="BUY",
                     volume=0.10,
                     sl_price=long_st.suggested_sl,
@@ -125,6 +140,7 @@ def run_live_auto_trading():
                     magic_number=cb_config.magic_number,
                     comment="Auto_TripleFilter_BUY"
                 )
+                ok, ticket, msg = res if (isinstance(res, tuple) and len(res) == 3) else (False, 0, str(res))
                 if ok:
                     print(f"✅ {msg}\n", flush=True)
                     storage.record_trade({
@@ -145,7 +161,7 @@ def run_live_auto_trading():
             # ================= EXECUTE SELL ORDER =================
             elif short_st.all_passed:
                 print(f"\n🎯 >>> ALL 5 CONDITIONS MET: EXECUTING SELL ORDER AT ${sym_info.bid:.2f} <<<", flush=True)
-                ok, ticket, msg = mt5_bridge.send_order(
+                res = mt5_bridge.send_order(
                     direction="SELL",
                     volume=0.10,
                     sl_price=short_st.suggested_sl,
@@ -153,6 +169,7 @@ def run_live_auto_trading():
                     magic_number=cb_config.magic_number,
                     comment="Auto_TripleFilter_SELL"
                 )
+                ok, ticket, msg = res if (isinstance(res, tuple) and len(res) == 3) else (False, 0, str(res))
                 if ok:
                     print(f"✅ {msg}\n", flush=True)
                     storage.record_trade({

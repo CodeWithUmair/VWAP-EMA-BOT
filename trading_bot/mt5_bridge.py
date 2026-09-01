@@ -153,6 +153,10 @@ class MT5Bridge:
             return False
         return bool(term.trade_allowed)
 
+    def is_algo_trading_allowed(self) -> bool:
+        """Alias for is_algo_trading_enabled."""
+        return self.is_algo_trading_enabled()
+
     def get_symbol_info(self, symbol: Optional[str] = None) -> SymbolInfo:
         """Fetches symbol specs and live spread."""
         sym = symbol or self.symbol
