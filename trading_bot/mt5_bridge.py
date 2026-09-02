@@ -227,17 +227,25 @@ class MT5Bridge:
             for i in range(len(bars_dict["closes"]))
         ]
 
-    def fetch_recent_bars(self, symbol: Optional[str] = None, count: int = 300) -> Dict[str, List]:
-        """Fetches recent 1-minute OHLCV bars."""
+    def fetch_recent_bars(self, symbol: Optional[str] = None, count: int = 300, timeframe_str: str = "M1") -> Dict[str, List]:
+        """Fetches recent OHLCV bars for M1, M5, or M15."""
         sym = symbol or self.symbol
 
         if self.is_simulation or not MT5_AVAILABLE or not self.is_connected:
             from trading_bot.data_feed import generate_realistic_gold_data
             return generate_realistic_gold_data(num_bars=count)
 
-        rates = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_M1, 0, count)
+        tf_map = {
+            "M1": getattr(mt5, "TIMEFRAME_M1", 1),
+            "M5": getattr(mt5, "TIMEFRAME_M5", 5),
+            "M15": getattr(mt5, "TIMEFRAME_M15", 15),
+            "H1": getattr(mt5, "TIMEFRAME_H1", 60),
+        }
+        mt5_tf = tf_map.get(timeframe_str.upper(), getattr(mt5, "TIMEFRAME_M1", 1))
+
+        rates = mt5.copy_rates_from_pos(sym, mt5_tf, 0, count)
         if rates is None or len(rates) == 0:
-            raise RuntimeError(f"Failed to fetch rates for {sym}: {mt5.last_error()}")
+            raise RuntimeError(f"Failed to fetch {timeframe_str} rates for {sym}: {mt5.last_error()}")
 
         times = [datetime.fromtimestamp(r['time'], tz=timezone.utc).isoformat() for r in rates]
         opens = [float(r['open']) for r in rates]
@@ -254,6 +262,11 @@ class MT5Bridge:
             "closes": closes,
             "volumes": volumes
         }
+
+    def fetch_htf_bars(self, symbol: Optional[str] = None, count: int = 100, timeframe: str = "M15") -> Dict[str, List]:
+        """Fetches higher timeframe bars (M15 or M5) for macro trend alignment."""
+        return self.fetch_recent_bars(symbol=symbol, count=count, timeframe_str=timeframe)
+
 
     def send_order(
         self,
