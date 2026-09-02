@@ -98,7 +98,13 @@ _THEME_CSS = """
     height: 100%; display: flex; flex-direction: column; justify-content: flex-start;
   }
 
+  /* auto-trade toggle: pin to the far right edge of its row */
+  .st-key-gx_autotrade { display: flex; flex-direction: column; align-items: flex-end; }
+  .st-key-gx_autotrade [data-testid="stWidgetLabel"] { justify-content: flex-end; }
+  .st-key-gx_autotrade [data-testid="stCaptionContainer"] { text-align: right; }
+
   /* tabs */
+  [data-testid="stTabs"] { margin-top: 16px; }
   [data-testid="stTabs"] [role="tablist"] { gap: 4px; border-bottom: 1px solid #262b36; }
   [data-testid="stTabs"] [role="tab"] {
     padding: 7px 16px; border-radius: 9px 9px 0 0; font-weight: 600; font-size: .85rem;
@@ -428,12 +434,26 @@ def main():
     # Top Status Bar — keyed container so the CSS can force every metric card to
     # the same height regardless of whether it carries a delta line.
     with st.container(key="gx_topmetrics"):
-        col1, col2, col3, col4, col5 = st.columns(5)
+        col1, col2, col3 = st.columns(3)
         col1.metric("Account Mode", acc.trade_mode, "DEMO ONLY" if acc.is_demo else "LIVE - BLOCKED")
         col2.metric("Balance", f"${acc.balance:,.2f}")
         col3.metric(f"Gold ({mt5_bridge.symbol}) Bid/Ask", f"${sym_info.bid:.2f} / ${sym_info.ask:.2f}", f"Spread: ${sym_info.spread_usd:.2f}")
+
+        col4, col5, col6 = st.columns(3)
         col4.metric("Consecutive Losses", f"{cb_manager.state.consecutive_losses} / {max_consec_losses}")
         col5.metric("Daily Net PnL", f"${cb_manager.state.daily_pnl_usd:+,.2f}")
+
+        # Live win rate from actual closed trades in SQLite (not the synthetic backtest).
+        closed_trades = [
+            t for t in (storage.get_all_trades(500) or [])
+            if t.get("exit_time") and t.get("net_pnl_usd") is not None
+        ]
+        if closed_trades:
+            wins = sum(1 for t in closed_trades if t["net_pnl_usd"] > 0)
+            win_rate = wins / len(closed_trades) * 100
+            col6.metric("Live Win Rate", f"{win_rate:.1f}%", f"{wins}W / {len(closed_trades) - wins}L")
+        else:
+            col6.metric("Live Win Rate", "—", "No closed trades yet")
 
     # ---- AUTO-ENGINE + OPEN POSITION status --------------------------------------
     # How the "LIVE" light works: the headless auto-trader (run_live_auto_bot.py)
@@ -447,7 +467,7 @@ def main():
 
     @st.fragment(run_every="1s")
     def _engine_status_row():
-        sc1, sc2 = st.columns([1, 2])
+        sc1, sc2, sc3 = st.columns([1, 2, 1])
 
         hb_raw = storage.get_setting("engine_heartbeat", None)
         hb_age = None
@@ -499,6 +519,21 @@ def main():
                 )
             else:
                 st.info("📌 No open position — the engine will take the next valid 5/5 signal.")
+
+        with sc3, st.container(key="gx_autotrade"):
+            auto_trade_on = storage.get_setting("auto_trade_enabled", True)
+            toggled = st.toggle(
+                "Auto-Trade",
+                value=auto_trade_on,
+                key="auto_trade_enabled_toggle",
+                help="ON: the headless engine opens trades on its own 5/5 signals. "
+                     "OFF: it keeps managing any open position (break-even, P&L) but "
+                     "won't open new ones — use the Manual Order Dispatch buttons below instead.",
+            )
+            if toggled != auto_trade_on:
+                storage.set_setting("auto_trade_enabled", toggled)
+                st.rerun()
+            st.caption("🟢 Auto" if toggled else "🟡 Manual-only")
 
     _engine_status_row()
 
@@ -574,7 +609,7 @@ def main():
             if st.button("🚀 Trigger Strategy BUY Order", key="btn_trigger_buy_order_main", type="primary", use_container_width=True):
                 ok, ticket, msg = mt5_bridge.send_order(
                     direction="BUY",
-                    volume=0.10,
+                    volume=0.01,
                     sl_price=long_st.suggested_sl,
                     tp_price=long_st.suggested_tp,
                     magic_number=magic_num,
@@ -586,7 +621,7 @@ def main():
                         "order_id": ticket,
                         "symbol": mt5_bridge.symbol,
                         "direction": "BUY",
-                        "volume": 0.10,
+                        "volume": 0.01,
                         "entry_price": long_st.close_price,
                         "sl": long_st.suggested_sl,
                         "tp": long_st.suggested_tp,
@@ -600,7 +635,7 @@ def main():
             if st.button("🔻 Trigger Strategy SELL Order", key="btn_trigger_sell_order_main", type="secondary", use_container_width=True):
                 ok, ticket, msg = mt5_bridge.send_order(
                     direction="SELL",
-                    volume=0.10,
+                    volume=0.01,
                     sl_price=short_st.suggested_sl,
                     tp_price=short_st.suggested_tp,
                     magic_number=magic_num,
@@ -612,7 +647,7 @@ def main():
                         "order_id": ticket,
                         "symbol": mt5_bridge.symbol,
                         "direction": "SELL",
-                        "volume": 0.10,
+                        "volume": 0.01,
                         "entry_price": short_st.close_price,
                         "sl": short_st.suggested_sl,
                         "tp": short_st.suggested_tp,

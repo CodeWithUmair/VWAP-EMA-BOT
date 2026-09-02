@@ -195,12 +195,18 @@ def run_live_auto_trading():
             if not can_trade:
                 continue
 
+            # Dashboard "Auto-Trade" toggle: when off, the engine still manages
+            # open positions (break-even, closed-deal tracking) above but won't
+            # open new ones — manual dispatch from the dashboard still works.
+            if not storage.get_setting("auto_trade_enabled", True):
+                continue
+
             # ================= EXECUTE BUY ORDER =================
             if long_st.all_passed:
                 print(f"\n🎯 >>> ALL 5 CONDITIONS MET: EXECUTING BUY ORDER AT ${sym_info.ask:.2f} <<<", flush=True)
                 res = mt5_bridge.send_order(
                     direction="BUY",
-                    volume=0.10,
+                    volume=0.01,
                     sl_price=long_st.suggested_sl,
                     tp_price=long_st.suggested_tp,
                     magic_number=cb_config.magic_number,
@@ -213,7 +219,7 @@ def run_live_auto_trading():
                         "order_id": ticket,
                         "symbol": mt5_bridge.symbol,
                         "direction": "BUY",
-                        "volume": 0.10,
+                        "volume": 0.01,
                         "entry_price": long_st.close_price,
                         "sl": long_st.suggested_sl,
                         "tp": long_st.suggested_tp,
@@ -229,7 +235,7 @@ def run_live_auto_trading():
                 print(f"\n🎯 >>> ALL 5 CONDITIONS MET: EXECUTING SELL ORDER AT ${sym_info.bid:.2f} <<<", flush=True)
                 res = mt5_bridge.send_order(
                     direction="SELL",
-                    volume=0.10,
+                    volume=0.01,
                     sl_price=short_st.suggested_sl,
                     tp_price=short_st.suggested_tp,
                     magic_number=cb_config.magic_number,
@@ -242,7 +248,7 @@ def run_live_auto_trading():
                         "order_id": ticket,
                         "symbol": mt5_bridge.symbol,
                         "direction": "SELL",
-                        "volume": 0.10,
+                        "volume": 0.01,
                         "entry_price": short_st.close_price,
                         "sl": short_st.suggested_sl,
                         "tp": short_st.suggested_tp,
