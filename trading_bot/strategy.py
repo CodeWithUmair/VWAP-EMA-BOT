@@ -27,9 +27,10 @@ class StrategyParameters:
 
     # 3. Order Block & Break of Structure (BOS) Settings
     ob_swing_lookback: int = 3          # Lookback bars for causal swing high/low
+    pivot_lookback: int = 3             # Alias for lookback bars
     ob_max_age_bars: int = 60           # Maximum bars an OB remains active
     ob_zone_type: str = "full"          # "full" (low to high) or "body" (open to close)
-    ob_buffer_atr: float = 0.2          # Buffer in ATR to touch/react to OB
+    ob_buffer_atr: float = 0.35         # Buffer in ATR to touch/react to OB
 
     # 4. Pullback Settings
     max_pullback_bars: int = 20         # Max bars after crossover before setup expires
@@ -45,9 +46,15 @@ class StrategyParameters:
     # 6. Exit & Risk:Reward Settings
     rr_ratio: float = 1.5               # Risk:Reward Ratio (1:1.5)
     sl_lookback_bars: int = 8           # Lookback bars for recent swing low/high
-    sl_buffer_atr: float = 0.20         # Extra cushion beyond swing in ATR
-    min_sl_distance_points: float = 1.0  # Minimum SL in USD ($1.00 on Gold)
+    sl_buffer_atr: float = 0.50         # Extra cushion beyond swing in ATR (breathing room)
+    min_sl_distance_points: float = 1.8  # Minimum SL in USD ($1.80 on Gold to avoid noise)
     max_sl_distance_points: float = 6.0  # Maximum allowable SL ($6.00 on Gold)
+
+    # 7. Multi-Timeframe & Session Settings
+    enable_htf_filter: bool = True       # Enforce 15M / 5M HTF trend alignment
+    htf_ema_period: int = 50             # 50-period EMA on HTF
+    enable_session_filter: bool = False  # Restrict to London/NY killzones only
+
 
 
 @dataclass
@@ -709,3 +716,59 @@ def evaluate_checklist_at_bar(
         "LONG": long_status,
         "SHORT": short_status
     }
+
+
+def is_in_killzone(utc_dt: Optional[datetime] = None) -> Tuple[bool, str]:
+    """
+    Checks if current UTC time falls within institutional high-volume killzones.
+    - London Killzone: 07:00 to 11:00 UTC
+    - New York Killzone: 12:30 to 17:00 UTC
+    Returns (in_killzone, session_name).
+    """
+    now = utc_dt or datetime.now(timezone.utc)
+    hour = now.hour
+    minute = now.minute
+    total_minutes = hour * 60 + minute
+
+    # London Killzone: 07:00 (420 min) to 11:00 (660 min)
+    if 420 <= total_minutes <= 660:
+        return True, "London Killzone (High Volatility)"
+
+    # New York Killzone: 12:30 (750 min) to 17:00 (1020 min)
+    if 750 <= total_minutes <= 1020:
+        return True, "New York Killzone (Peak Momentum)"
+
+    return False, "Off-Hours / Asian Consolidation"
+
+
+def evaluate_htf_trend(
+    htf_closes: List[float],
+    period: int = 50
+) -> Tuple[str, float, str]:
+    """
+    Calculates Higher Timeframe (M15 or M5) EMA 50 trend alignment.
+    Returns (trend_direction, ema_value, reason).
+    trend_direction is "BULLISH", "BEARISH", or "NEUTRAL".
+    """
+    if not htf_closes or len(htf_closes) < period:
+        return "NEUTRAL", 0.0, "Insufficient HTF history"
+
+    ema_htf = calculate_ema(htf_closes, period)
+    if not ema_htf:
+        return "NEUTRAL", 0.0, "Could not compute HTF EMA"
+
+    curr_close = htf_closes[-1]
+    curr_ema = ema_htf[-1]
+
+    # Check slope over last 3 bars for strong momentum
+    slope = curr_ema - ema_htf[-3] if len(ema_htf) >= 3 else 0.0
+
+    if curr_close > curr_ema and slope >= 0:
+        return "BULLISH", curr_ema, f"HTF Price (${curr_close:.2f}) > EMA{period} (${curr_ema:.2f}) [Uptrend]"
+    elif curr_close < curr_ema and slope <= 0:
+        return "BEARISH", curr_ema, f"HTF Price (${curr_close:.2f}) < EMA{period} (${curr_ema:.2f}) [Downtrend]"
+    elif curr_close > curr_ema:
+        return "BULLISH", curr_ema, f"HTF Price (${curr_close:.2f}) > EMA{period} (${curr_ema:.2f})"
+    else:
+        return "BEARISH", curr_ema, f"HTF Price (${curr_close:.2f}) < EMA{period} (${curr_ema:.2f})"
+
