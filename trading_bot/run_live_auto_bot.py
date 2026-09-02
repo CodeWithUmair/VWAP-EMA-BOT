@@ -63,6 +63,14 @@ def run_live_auto_trading():
     start_session_time = int(time.time())
     processed_deal_tickets = set()
     be_moved_tickets = set()
+    pos_tp = {}       # ticket -> take-profit price, snapshotted while the position is open
+    be_lock = {}      # ticket -> shield stop price, set when the profit shield arms
+
+    # Profit-shield tuning: arm once 60% of the way to TP, lock in up to $2.50 of price
+    # (capped at 40% of the target so tight-target trades keep a buffer to current price).
+    SHIELD_ARM_FRAC = 0.60
+    SHIELD_LOCK_USD = 2.50
+    SHIELD_LOCK_CAP_FRAC = 0.40
 
     # Heartbeat for the dashboard's AUTO-ENGINE indicator (read from SQLite settings).
     try:
@@ -92,25 +100,30 @@ def run_live_auto_trading():
                 current_p = pos["current_price"]
                 sl = pos["sl"]
                 tp = pos["tp"]
+                pos_tp[ticket] = tp
 
                 if ticket not in be_moved_tickets and tp > 0 and sl > 0:
                     if direction == "BUY":
                         target_dist = tp - entry_p
                         current_gain = current_p - entry_p
-                        if current_gain >= target_dist * 0.45 and sl < entry_p:
-                            new_sl = entry_p + (sym_info.spread_usd or 0.15)
+                        if current_gain >= target_dist * SHIELD_ARM_FRAC and sl < entry_p:
+                            lock = min(SHIELD_LOCK_USD, target_dist * SHIELD_LOCK_CAP_FRAC)
+                            new_sl = entry_p + lock
                             if mt5_bridge.modify_position_sl(ticket, new_sl):
                                 be_moved_tickets.add(ticket)
-                                print(f"🔒 [PROFIT SHIELD] BUY Order {ticket} moved to Break-Even at ${new_sl:.2f}!", flush=True)
+                                be_lock[ticket] = new_sl
+                                print(f"🔒 [PROFIT SHIELD] BUY Order {ticket} locked +${lock:.2f} at ${new_sl:.2f}!", flush=True)
 
                     elif direction == "SELL":
                         target_dist = entry_p - tp
                         current_gain = entry_p - current_p
-                        if current_gain >= target_dist * 0.45 and sl > entry_p:
-                            new_sl = entry_p - (sym_info.spread_usd or 0.15)
+                        if current_gain >= target_dist * SHIELD_ARM_FRAC and sl > entry_p:
+                            lock = min(SHIELD_LOCK_USD, target_dist * SHIELD_LOCK_CAP_FRAC)
+                            new_sl = entry_p - lock
                             if mt5_bridge.modify_position_sl(ticket, new_sl):
                                 be_moved_tickets.add(ticket)
-                                print(f"🔒 [PROFIT SHIELD] SELL Order {ticket} moved to Break-Even at ${new_sl:.2f}!", flush=True)
+                                be_lock[ticket] = new_sl
+                                print(f"🔒 [PROFIT SHIELD] SELL Order {ticket} locked +${lock:.2f} at ${new_sl:.2f}!", flush=True)
 
             # 2. Check deals closed during current live session
             if hasattr(mt5_bridge, "get_closed_deals"):
@@ -121,10 +134,26 @@ def run_live_auto_trading():
                         processed_deal_tickets.add(ticket)
                         pnl = deal["profit"]
                         exit_p = deal["close_price"]
-                        storage.update_closed_trade(ticket, exit_p, pnl, exit_reason="MT5 Deal Closed")
+
+                        # Classify the exit: shield stop (scratch), take-profit, or original stop.
+                        lock_ref = be_lock.get(ticket)
+                        tp_ref = pos_tp.get(ticket)
+                        if lock_ref is not None and abs(exit_p - lock_ref) <= 0.40:
+                            exit_reason = "Break-Even Shield"
+                        elif tp_ref and abs(exit_p - tp_ref) <= 0.40:
+                            exit_reason = "TP Hit"
+                        elif pnl > 0:
+                            exit_reason = "TP Hit"
+                        else:
+                            exit_reason = "SL Hit"
+
+                        storage.update_closed_trade(ticket, exit_p, pnl, exit_reason=exit_reason)
                         cb_manager.record_trade_outcome(net_pnl_usd=pnl, current_balance=acc.balance)
-                        
-                        if pnl < 0:
+
+                        if exit_reason == "Break-Even Shield":
+                            sign = "+" if pnl >= 0 else "-"
+                            print(f"🛡️ [TRADE CLOSED - SCRATCH] Deal {ticket} shielded at {sign}${abs(pnl):.2f} (break-even).", flush=True)
+                        elif pnl < 0:
                             last_loss_time = time.time()
                             print(f"⚠️ [TRADE CLOSED - LOSS] Deal {ticket} closed at -${abs(pnl):.2f}. Cooling for 3 mins.", flush=True)
                         else:
