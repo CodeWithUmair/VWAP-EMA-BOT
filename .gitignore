@@ -13,3 +13,9 @@ __pycache__/
 acct*.sqlite
 vwap_*.sqlite
 *.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# DB backups / restore side-copies (carry these by hand between machines)
+backups/
+trading_bot_data.sqlite.bak-*

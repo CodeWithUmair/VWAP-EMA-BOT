@@ -151,6 +151,42 @@ conversation (carry the file by hand, or don't commit it) — not `git add`.
 
 ---
 
+## 5b. Moving the bot + trade history to another machine
+
+This bot's **entire persistence is one file**: `trading_bot_data.sqlite` at the repo
+root (tables: `trades`, `settings`, `bot_logs`; `journal_mode=delete`, so no
+`-wal`/`-shm` sidecars between runs). No Postgres, no `pg_dump`. Moving it = copying
+that one file. Scripts added this session:
+
+```
+# on THIS machine, bot STOPPED:
+./scripts/db-backup.ps1
+#   -> backups/trading_bot_data_<stamp>.sqlite   (backups/ is gitignored)
+
+# carry that file (USB / cloud drive) to the OTHER machine, then there:
+git clone https://github.com/CodeWithUmair/VWAP-EMA-BOT.git
+cd VWAP-EMA-BOT
+python -m venv venv ; ./venv/Scripts/pip install -r requirements.txt
+./scripts/db-restore.ps1 <path-to-that-file>
+#   -> replaces trading_bot_data.sqlite (old one moved to .bak-<stamp>, never deleted)
+```
+
+`db-restore.ps1` refuses to run while `run_live_auto_bot.py` or the Streamlit app is
+up. Both scripts are `Copy-Item` only — nothing clever.
+
+**Important — the file is nearly empty right now.** After the git sync it holds only
+the **6 upstream rows**; this session's ~13 demo trades were discarded with the
+revert (§5). So "carrying the DB" today carries almost nothing. The real record is
+in **MT5's own deal history** for magic `9212001`. The current
+`run_live_auto_bot.py` only reconciles deals **since the process started**
+(`get_closed_deals(from_timestamp=start_session_time)`), so it will **not** backfill
+old trades into SQLite on the new machine.
+
+**If the owner wants full history rebuilt into SQLite** (either machine): a small
+one-off script is needed — `mt5.history_deals_get(2020-01-01, now)`, filter
+`magic == 9212001` and `entry == 1` (closes), and `storage.record_trade` /
+`storage.update_closed_trade` each. ~30 lines, not written yet. Ask for it.
+
 ## 6. How to run (current, post-sync)
 
 From `d:/mine/Bots/VWAP-EMA-BOT`, venv at `venv/`:
@@ -178,8 +214,8 @@ From `d:/mine/Bots/VWAP-EMA-BOT`, venv at `venv/`:
 
 ## 7. Open items / next session
 
-1. **Push `f8074da`.** `git push origin main` was blocked in this session's sandbox —
-   the owner needs to run it (or approve the push).
+1. **Push `f8074da` + `94a4836` + this session's docs commit.** `git push origin main`
+   was blocked in this session's sandbox — the owner needs to run it.
 2. **`run_account.py` is stale** — it carries the *old* runner loop. Re-sync it to
    the friend's single-position / break-even / cooldown logic before using it for a
    real second account. Multi-account concurrency still also needs a *second* MT5
