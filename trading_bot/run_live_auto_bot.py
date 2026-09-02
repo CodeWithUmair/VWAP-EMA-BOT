@@ -64,9 +64,22 @@ def run_live_auto_trading():
     processed_deal_tickets = set()
     be_moved_tickets = set()
 
+    # Heartbeat for the dashboard's AUTO-ENGINE indicator (read from SQLite settings).
+    try:
+        storage.set_setting("engine_started_at", datetime.now(timezone.utc).isoformat())
+        storage.set_setting("engine_pid", os.getpid())
+    except Exception:
+        pass
+
     try:
         while True:
             time.sleep(3)
+
+            # Refresh the heartbeat every loop; a transient DB lock must never stop trading.
+            try:
+                storage.set_setting("engine_heartbeat", datetime.now(timezone.utc).isoformat())
+            except Exception:
+                pass
 
             # 1. Fetch open positions and manage Break-Even
             open_positions = mt5_bridge.get_open_positions()

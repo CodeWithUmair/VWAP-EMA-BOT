@@ -11,3 +11,5 @@ __pycache__/
 
 # per-account SQLite files if you run the multi-account setup
 acct*.sqlite
+vwap_*.sqlite
+*.sqlite-journal

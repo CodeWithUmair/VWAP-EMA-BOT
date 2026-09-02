@@ -1,0 +1,14 @@
+# Dashboard theme for trading_bot/streamlit_app.py. Native theme tokens — these are
+# version-stable (unlike CSS selectors). The finer polish (chrome hiding, padding,
+# cards) is CSS injected from streamlit_app.py's _inject_theme().
+
+[theme]
+base = "dark"
+primaryColor = "#E6B450"              # gold accent
+backgroundColor = "#0E1117"
+secondaryBackgroundColor = "#161A22"
+textColor = "#E8EAED"
+font = "sans serif"
+
+[browser]
+gatherUsageStats = false
