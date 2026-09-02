@@ -19,3 +19,6 @@ vwap_*.sqlite
 # DB backups / restore side-copies (carry these by hand between machines)
 backups/
 trading_bot_data.sqlite.bak-*
+
+# runtime DB (churns constantly; MT5 is source of truth)
+trading_bot_data.sqlite
