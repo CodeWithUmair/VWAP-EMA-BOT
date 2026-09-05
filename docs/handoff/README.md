@@ -27,33 +27,39 @@ made, and update the snapshot below.
 
 ## Update — 2026-09-02 (two sessions)
 
-**Latest: `sessions/2026-09-02-dashboard-ui-heartbeat-and-sync.md`** — read that first.
+**Latest: `sessions/2026-09-02-dashboard-ui-heartbeat-and-sync.md`** — read that first
+(it has a "START HERE" block).
 
-- **Synced upstream.** `main` fast-forwarded to `0cdb1ba` (friend's "PRO SCALPER"
-  update) + this session's commit **`f8074da`** on top. **`f8074da` is NOT pushed yet**
-  — sandbox blocked `git push`; owner must run it.
-- **Friend's update:** `run_live_auto_bot.py` rewritten — **single-position guard**
-  (no more trade stacking), break-even auto-lock, 3-min post-loss cooldown, ATR floor
-  0.40, retuned params (`max_pullback_bars` 40, `ob_buffer_atr` 0.40,
-  `pullback_atr_mult` 2.0; breakers 4 losses / $250 / 3-min). `mt5_bridge.py` +3
-  methods (`get_open_positions`, `get_closed_deals`, `modify_position_sl`).
-  **`strategy.py` / `backtest.py` untouched (hash-verified).**
+- **`main` == `origin/main` (`54fd010`) + 1 unpushed:** `1a1af5d` (real-data
+  backtest — `git push origin main`). Recent history: `f8074da` (UI + heartbeat) →
+  `94a4836` (handoff) → `2a1d3dd` (db scripts) → **friend:** `476c848` (dashboard
+  toggles) → `e01ff2f` (profit-shield tune) → `dc13713` (untrack pyc + sqlite) →
+  `7282ebd` upstream (**M15 HTF filter + killzone — `strategy.py` +69**) → `54fd010`
+  merge → **this session:** `1a1af5d`.
+- **`git status` is clean now** — `dc13713` untracked the pyc + `trading_bot_data
+  .sqlite` and gitignored them. No more churn.
+- **Nothing running** — auto-trader and dashboard both stopped.
+- **Runner (`run_live_auto_bot.py`) as it stands:** single-position guard, break-even
+  "profit shield" (arms at **60%** to TP, locks **+$2.50**), 3-min post-loss cooldown,
+  **M15 HTF trend filter ON** (`enable_htf_filter=True`), killzone filter available
+  (off), **lot size 0.01** (was 0.10), daily-loss ceiling **$500**, 6 consecutive
+  losses. `mt5_bridge.py` has `get_open_positions` / `get_closed_deals` /
+  `modify_position_sl`. Heartbeat (`f8074da`) still in place.
+- **`strategy.py` changed** (`7282ebd`) — `evaluate_htf_trend` + `is_in_killzone`
+  added. Tests **14/14**.
 - **Dashboard overhauled** (`streamlit_app.py`, presentation only): Streamlit chrome
   hidden, top padding cut, dark+gold theme (`.streamlit/config.toml` + injected CSS),
-  branded header, equal-height metric cards, PASS/FAIL checklist rows. New
-  **AUTO-ENGINE LIVE strip** (reads `engine_heartbeat`, 1s self-refresh fragment,
-  pulsing dot) + live open-position banner. New **Trade History table** (3s refresh,
-  green/red P&L, open trades pulse pink with live MT5 P&L).
-- **Heartbeat:** `run_live_auto_bot.py` +13 lines writing `engine_heartbeat` /
-  `engine_pid` / `engine_started_at` to SQLite each loop (try/except-guarded). Only
-  code delta vs the friend's runner.
-- **`run_account.py`** (multi-account launcher) exists but carries the *old* loop —
-  re-sync before real use. Concurrency still needs a 2nd MT5 terminal install
+  branded header, equal-height metric cards, PASS/FAIL checklist rows, **AUTO-ENGINE
+  LIVE strip** (heartbeat, 1s self-refresh) + live open-position banner, **Trade
+  History table** (3s refresh, green/red P&L, open trades pulse pink with live MT5 P&L).
+- **Real-data backtest added** (`1a1af5d`, not pushed): `run_backtest.py --real`
+  (pull M1 from MT5) or `--csv <export>`. First path to an honest gate read.
+- **`run_account.py`** (multi-account launcher) carries the *old* loop — now far
+  behind; re-sync before real use. Concurrency still needs a 2nd MT5 terminal install
   (spare demo accounts **472611148 / 474438988 / 474438985**).
-- **SQLite DB not committed** — `trading_bot_data.sqlite` reverted to upstream; local
-  demo rows discarded on purpose (churning binary; MT5 is source of truth).
 - Account **472544446**, balance **~$9,754** (down ~$147, mostly old-runner stacking
-  before the guard). Tests 14/14. Backtest still synthetic / OOS −0.52R / gate FAILED.
+  before the guard). Backtest still synthetic-only until someone runs `--real`;
+  historical OOS −0.52R, gate FAILED, bypassed on demo.
 
 ## Current state — snapshot (as of 2026-09-01, first session)
 

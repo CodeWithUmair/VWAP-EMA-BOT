@@ -4,10 +4,35 @@
 repo at the owner's request. Follows `2026-09-02-multi-account-launcher.md` the same
 day.
 
-**Scope this session:** ran the bot live on demo, pulled the friend's pushed update,
-built the dashboard AUTO-ENGINE indicator + heartbeat, and did a full visual
-restyle of `streamlit_app.py`. **No strategy / backtest / circuit-breaker code was
-changed.** One commit: **`f8074da`** (on `main`, **not yet pushed** — see §7).
+**Scope this session:** ran the bot live on demo, synced the friend's pushed updates
+(twice — see §2 and §2b), built the dashboard AUTO-ENGINE indicator + heartbeat, did
+a full visual restyle of `streamlit_app.py`, added the SQLite backup/restore scripts,
+and committed a real-data backtest feature that was sitting pre-staged in the tree.
+**This session changed no strategy/backtest logic itself** — but the friend's second
+sync (`7282ebd`) *does* change `strategy.py` (M15 HTF filter). Commits this session:
+`f8074da` · `94a4836` · `2a1d3dd` (all pushed, now buried under the friend's newer
+commits) · **`1a1af5d`** (real-data backtest — **NOT pushed**, see §7.1).
+
+---
+
+## START HERE (next session)
+
+- **`main` == `origin/main` + 1.** Local is one commit ahead: **`1a1af5d`**
+  (`backtest: real M1 data sources`) — needs `git push origin main`. Everything else
+  is synced. History tip: `54fd010` (origin) ← `1a1af5d` (local).
+- **`git status` is clean** (pyc + `trading_bot_data.sqlite` are now gitignored —
+  commit `dc13713` — so no more churn).
+- **Nothing is running.** No auto-trader, no dashboard.
+- **Account `472544446`** (Exness demo), balance **~$9,754**, **0 open positions**.
+- **The runner (`run_live_auto_bot.py`) is now heavily evolved** by the friend —
+  M15 HTF trend filter ON, killzone filter available (off), profit shield arms at 60%
+  of the way to TP and locks +$2.50, **lot size dropped to 0.01 micro**, daily-loss
+  ceiling $500, 6 consecutive losses. Single-position guard still there.
+- **`strategy.py` changed** (`7282ebd`) — new `evaluate_htf_trend` + `is_in_killzone`.
+  Tests still **14/14**.
+- **Most likely next asks:** (a) push `1a1af5d`, (b) run the real-data backtest
+  (`run_backtest.py --real` or `--csv`) now that it exists, (c) re-sync
+  `run_account.py` (§7.2), (d) "rebuild history from MT5" script (§5b).
 
 ---
 
@@ -15,11 +40,12 @@ changed.** One commit: **`f8074da`** (on `main`, **not yet pushed** — see §7)
 
 | | |
 |---|---|
-| **Branch / HEAD** | `main` at `f8074da`. Fast-forwarded past the friend's 3 commits (`0cdb1ba` merge of `uzairshaikh346:main`) first, then this session's commit on top. `git status` clean. |
-| **Unpushed** | `f8074da` only. `git push origin main` was **blocked by the sandbox** — the owner must run it (see §7). |
-| **MT5 account** | `472544446` (Exness demo, server `Exness-MT5Trial16`), **balance ~$9,754.86**, **0 open positions**. Down ~$147 from ~$9,902 at the start of the day — almost all of it from the *old* runner stacking trades before the single-position guard landed. HEDGING account (`margin_mode=2`). |
-| **Processes** | **Nothing running.** The headless auto-trader and the Streamlit dashboard were both started and stopped several times this session; both are stopped now. |
-| **Local SQLite** | `trading_bot_data.sqlite` was reverted to the committed upstream version (6 rows). This session's demo trades are **not** in it (see §5). |
+| **Branch / HEAD** | `main` at **`1a1af5d`** = `origin/main` (`54fd010`) **+ 1 unpushed commit**. Full recent history: `2a1d3dd` → `476c848` (friend: auto-trade toggle / win-rate / min lot) → `e01ff2f` (friend: profit-shield tune) → `dc13713` (friend: untrack pyc + sqlite) → `7282ebd` (upstream: M15 HTF + killzone) → `54fd010` (merge) → **`1a1af5d`** (this session: real-data backtest). |
+| **Unpushed** | `1a1af5d` only. |
+| **Sync drama** | Handoff commit was made mid-session while `origin/main` had already moved on → branches diverged. Recovered with `reset --soft` + stash + `merge --ff-only` + separate clean commits. The pre-staged real-data-backtest work (`data_feed.py` +110, `run_backtest.py` +44) that got swept into the bad commit is now its own commit `1a1af5d`. Nothing lost. |
+| **MT5 account** | `472544446` (Exness demo, server `Exness-MT5Trial16`), **balance ~$9,754.86**, **0 open positions**. Down ~$147 from ~$9,902 — almost all from the *old* runner stacking trades before the single-position guard. HEDGING account (`margin_mode=2`). |
+| **Processes** | **Nothing running.** |
+| **Local SQLite** | `trading_bot_data.sqlite` is now **gitignored** (`dc13713`); working copy holds only the old 6 upstream rows + this session's engine heartbeat settings. Real trade record is MT5. |
 
 ---
 
@@ -64,7 +90,35 @@ reasoning about live behaviour:
 
 ---
 
-## 3. This session's changes (commit `f8074da`)
+## 2b. Friend's SECOND sync — landed mid-session (commits `476c848`→`54fd010`)
+
+The friend kept pushing while this session worked. Fast-forwarded local past all of it.
+
+| commit | what |
+|---|---|
+| `476c848` | dashboard: auto-trade toggle, live win-rate metric, min lot size |
+| `e01ff2f` | profit-shield tune — arm at **60%** of the way to TP (was 45%), lock **+$2.50** capped at 40% of target, and label exits (`Break-Even Shield` / `TP Hit` / `SL Hit`) |
+| `dc13713` | **`git rm --cached` the `__pycache__/*.pyc` + `trading_bot_data.sqlite`** and gitignored them → the churn that plagued every earlier `git status` is gone |
+| `7282ebd` | **upstream `uzairshaikh346:main`** — **`strategy.py` +69**: new `evaluate_htf_trend` (M15 EMA-50 alignment) + `is_in_killzone` (London/NY session windows) |
+| `54fd010` | merge of `7282ebd` |
+
+**`run_live_auto_bot.py` after this sync** (the heartbeat from `f8074da` survived,
+it's still there):
+- `params.enable_htf_filter = True` — **only trades with the M15 macro trend now.**
+- `params.enable_session_filter = False` — killzone-only mode available, off by default.
+- **`trade_lot_size = 0.01`** — dropped from 0.10 to micro-lot.
+- `min_sl_distance_points = 1.8` (was 1.0), `sl_buffer_atr = 0.50`.
+- Circuit breakers: **6** consecutive losses, **$500** daily loss (was 4 / $250).
+- `max_pullback_bars` back to **35**, `ob_buffer_atr` **0.35**, `pullback_atr_mult`
+  **1.8** (the §2 retune was reverted upstream).
+- Profit shield: `SHIELD_ARM_FRAC=0.60`, `SHIELD_LOCK_USD=2.50`,
+  `SHIELD_LOCK_CAP_FRAC=0.40`; exit-reason classification via `pos_tp` / `be_lock`.
+
+`run_tests.py` → **14/14** against the new `strategy.py`.
+
+---
+
+## 3. This session's changes (commits `f8074da`, `94a4836`, `2a1d3dd`, `1a1af5d`)
 
 ### `trading_bot/run_live_auto_bot.py` — +13 lines, heartbeat only
 The only delta vs the friend's version:
@@ -119,6 +173,18 @@ logic touched.
 - **`.env.example`**, **`SCALPING-BOT-SQLITE-MIGRATION.md`** (a Postgres→SQLite
   proposal for the *sibling* `scalping_bot` repo — full version lives at
   `d:/mine/Bots/scalping_bot/docs/sqlite-migration-proposal.md`).
+- **`scripts/db-backup.ps1`** / **`scripts/db-restore.ps1`** (commit `2a1d3dd`) —
+  one-file SQLite move between machines (`Copy-Item` only; restore refuses to run
+  while the bot/dashboard is up; `backups/` and `*.bak-*` gitignored). See §5b.
+
+### Commit `1a1af5d` — real-data backtest (was pre-staged in the tree, not written this session)
+`data_feed.py` gains `fetch_real_gold_data()` (pull M1 from the running MT5 terminal,
+walks a ladder of request sizes for the per-call cap) and `load_gold_csv()` (MT5
+chart "Save" export, auto-detects delimiter/header/column order). `run_backtest.py`
+gains `--real` / `--csv PATH` / `--symbol` / `--bars` / `--shuffles`; default stays
+synthetic. This is the **"no real-data backtest" open item finally addressed** — run
+`./venv/Scripts/python trading_bot/run_backtest.py --real` (MT5 must be open) or
+`--csv <export>` for an honest gate read. **Not pushed yet.**
 
 ---
 
@@ -195,13 +261,16 @@ From `d:/mine/Bots/VWAP-EMA-BOT`, venv at `venv/`:
 |---|---|
 | Unit tests (14) | `./venv/Scripts/python trading_bot/run_tests.py` |
 | Backtest (synthetic) | `PYTHONUTF8=1 ./venv/Scripts/python trading_bot/run_backtest.py` |
+| **Backtest (REAL M1 from MT5)** | `PYTHONUTF8=1 ./venv/Scripts/python trading_bot/run_backtest.py --real` (terminal must be open) |
+| **Backtest (real, from CSV)** | `... run_backtest.py --csv "C:\path\XAUUSDm_M1.csv"` |
 | **Headless auto-trader** | `PYTHONUTF8=1 ./venv/Scripts/python trading_bot/run_live_auto_bot.py` |
 | **Dashboard** | `PYTHONUTF8=1 ./venv/Scripts/streamlit run trading_bot/streamlit_app.py --server.port 8502` |
 
 - `run_live_auto_bot.py` still needs `PYTHONUTF8=1` when stdout isn't a console (emoji
   banner). `streamlit_app.py` and `run_account.py` are ASCII-safe.
-- The engine has **no arm switch** — places a real (demo) 0.10-lot order the moment
-  all 5 filters pass on one side; now capped at **one open position at a time**.
+- The engine has **no arm switch** — places a real (demo) **0.01-lot** order the moment
+  all 5 filters + the M15 HTF trend agree on one side; capped at **one open position
+  at a time**.
 - BUY and SELL are mutually exclusive per bar (VWAP + EMA filters are directionally
   opposite), so "both directions active" = it watches both and takes whichever fires;
   it never holds a BUY and a SELL together.
@@ -214,19 +283,26 @@ From `d:/mine/Bots/VWAP-EMA-BOT`, venv at `venv/`:
 
 ## 7. Open items / next session
 
-1. **Push `f8074da` + `94a4836` + this session's docs commit.** `git push origin main`
-   was blocked in this session's sandbox — the owner needs to run it.
-2. **`run_account.py` is stale** — it carries the *old* runner loop. Re-sync it to
-   the friend's single-position / break-even / cooldown logic before using it for a
-   real second account. Multi-account concurrency still also needs a *second* MT5
-   terminal install (see `2026-09-02-multi-account-launcher.md` §"Not done").
-3. **Chop performance.** The owner flagged ranging-market losses (screenshot). The
-   real lever is the **ATR floor** in `run_live_auto_bot.py` (`curr_atr < 0.40`) —
-   raising to ~0.80–1.00 skips dead bars. Not changed this session (would be a code
-   edit the owner hadn't approved at that point).
-4. **Hedged BUY+SELL** was discussed and **declined** — a same-time hedge locks P&L
-   at the entry gap and pays spread twice; this is a trend system. If ever wanted,
-   put it behind a flag and run it on a *separate* demo account.
-5. **No real-data backtest** still — every metric is synthetic; OOS is −0.52R; noise
-   gate FAILED but bypassed on demo. Unchanged since 2026-09-01.
-6. Circuit-breaker state is still per-process / in-memory (resets on restart).
+1. **Push `1a1af5d`** — `git push origin main`. It's the only unpushed commit
+   (real-data backtest). `f8074da` / `94a4836` / `2a1d3dd` already went up earlier;
+   the friend then pushed `476c848`→`54fd010` on top. Local == origin + this one.
+2. **Run the real-data backtest** now that it exists — `run_backtest.py --real`
+   (or `--csv`). This is the first chance for an *honest* noise-gate read; every
+   number before now was synthetic (OOS −0.52R, gate FAILED, bypassed on demo).
+3. **`run_account.py` is stale** — carries the pre-`0cdb1ba` runner loop. It's now
+   *far* behind (no single-position guard, no HTF filter, no profit shield, wrong lot
+   size). Re-sync to `run_live_auto_bot.py` before any real second-account use.
+   Multi-account concurrency also still needs a *second* MT5 terminal install
+   (`2026-09-02-multi-account-launcher.md` §"Not done").
+4. **Chop performance.** Owner flagged ranging-market losses. The friend's `7282ebd`
+   M15 HTF filter (`enable_htf_filter=True`) is the upstream answer — trades only with
+   the M15 macro trend. If it's still choppy, `enable_session_filter=True` restricts
+   to London/NY killzones, or raise the ATR floor. Watch a session first.
+5. **Hedged BUY+SELL** — discussed and **declined** (locks P&L at the entry gap, pays
+   spread twice, this is a trend system). Behind a flag on a separate demo if ever.
+6. **`run_live_auto_bot.py` now trades 0.01 lots** (friend dropped it from 0.10).
+   Dashboard manual buttons still send **0.10** — mismatch, worth aligning.
+7. Circuit-breaker state still per-process / in-memory (resets on restart).
+8. **`git status` churn is gone** — `dc13713` untracked the pyc + `trading_bot_data
+   .sqlite`. If a fresh clone needs a starting DB, `storage.BotStorage()` creates the
+   schema on first run.
