@@ -40,13 +40,29 @@ def format_metrics_table(metrics, title):
 +-----------------------------------------------------------------------+"""
 
 
-def run_full_backtest_cli(bars_count: int = 3000, num_shuffles: int = 100):
+def run_full_backtest_cli(bars_count: int = 3000, num_shuffles: int = 100,
+                          source: str = "synthetic", csv_path: str = None,
+                          symbol: str = "XAUUSDm"):
     print("=" * 73)
     print("  XAU/USD TRIPLE FILTER EMA 9/21 + VWAP + ORDER BLOCK BACKTEST GATE")
     print("=" * 73)
-    print(f"Loading {bars_count} bars of 1-minute XAU/USD data...")
-    data = generate_realistic_gold_data(num_bars=bars_count, seed=101)
-    
+
+    if source == "csv":
+        from trading_bot.data_feed import load_gold_csv
+        print(f"Loading real 1-minute XAU/USD data from {csv_path} ...")
+        data = load_gold_csv(csv_path)
+    elif source == "real":
+        from trading_bot.data_feed import fetch_real_gold_data
+        print(f"Loading real 1-minute {symbol} history from the MT5 terminal ...")
+        data = fetch_real_gold_data(count=bars_count, symbol=symbol)
+    else:
+        print(f"Loading {bars_count} bars of SYNTHETIC 1-minute XAU/USD data "
+              f"(random walk — a gate pass here only means the RNG has no edge)...")
+        data = generate_realistic_gold_data(num_bars=bars_count, seed=101)
+
+    n = len(data["closes"])
+    print(f"  {n:,} bars  {data['times'][0]}  ->  {data['times'][-1]}")
+
     params = StrategyParameters(
         ema_fast_period=9,
         ema_slow_period=21,
@@ -98,4 +114,22 @@ def run_full_backtest_cli(bars_count: int = 3000, num_shuffles: int = 100):
     return result
 
 if __name__ == "__main__":
-    run_full_backtest_cli()
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        description="Backtest the Triple-Filter strategy and run the noise-control gate."
+    )
+    src = ap.add_mutually_exclusive_group()
+    src.add_argument("--real", action="store_true",
+                     help="use real M1 history from the running MT5 terminal (not the RNG)")
+    src.add_argument("--csv", metavar="PATH",
+                     help="use real M1 history from a CSV export (MT5 chart 'Save')")
+    ap.add_argument("--symbol", default="XAUUSDm", help="MT5 symbol for --real (default XAUUSDm)")
+    ap.add_argument("--bars", type=int, default=3000,
+                    help="synthetic bar count, or max bars to request for --real")
+    ap.add_argument("--shuffles", type=int, default=100, help="noise-control reshuffles")
+    a = ap.parse_args()
+
+    source = "csv" if a.csv else "real" if a.real else "synthetic"
+    run_full_backtest_cli(bars_count=a.bars, num_shuffles=a.shuffles,
+                          source=source, csv_path=a.csv, symbol=a.symbol)
