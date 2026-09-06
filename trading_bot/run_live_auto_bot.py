@@ -82,6 +82,24 @@ LIVE_PARAM_OVERRIDES = {
 }
 
 
+def load_strategy_settings(storage, strategy):
+    """Resolve this strategy's parameters: defaults, then live tuning, then the
+    dashboard's saved values.
+
+    The sidebar writes every control to the SQLite settings table, so whatever
+    the user last set there is what the engine trades with. Without this last
+    layer the dashboard would look like it configured the bot while the engine
+    quietly ran its own hard-coded numbers.
+    """
+    values = {spec.key: spec.default for spec in strategy.param_specs()}
+    values.update(LIVE_PARAM_OVERRIDES.get(strategy.key, {}))
+    for spec in strategy.param_specs():
+        saved = storage.get_setting(f"param.{strategy.key}.{spec.key}", None)
+        if saved is not None:
+            values[spec.key] = saved
+    return values
+
+
 def resolve_strategy(storage, cli_key=None):
     """Pick the strategy this run trades: CLI flag, else the dashboard's choice.
 
@@ -102,10 +120,7 @@ def run_live_auto_trading(strategy_key: str = None):
     storage = BotStorage()
     strategy, chosen_via = resolve_strategy(storage, strategy_key)
 
-    params = strategy.build_params({
-        **{s.key: s.default for s in strategy.param_specs()},
-        **LIVE_PARAM_OVERRIDES.get(strategy.key, {}),
-    })
+    params = strategy.build_params(load_strategy_settings(storage, strategy))
 
     print("=" * 85, flush=True)
     print(f"🚀 STARTING LIVE ENGINE — {strategy.label.upper()} ({strategy.timeframe})", flush=True)
@@ -137,12 +152,19 @@ def run_live_auto_trading(strategy_key: str = None):
     acc = mt5_bridge.get_account_info()
     algo_allowed = mt5_bridge.is_algo_trading_enabled()
 
-    # Daily loss ceiling = 10% of balance, floored at $5 so tiny accounts still trade.
-    cb_config.max_daily_loss_usd = max(round(acc.balance * 0.10, 2), 5.0)
+    # Risk caps: whatever the dashboard last saved, else 10% of balance floored
+    # at $5 so a small account still trades but is never uncapped.
+    cb_config.max_daily_loss_usd = float(storage.get_setting(
+        "risk.max_daily_loss_usd", max(round(acc.balance * 0.10, 2), 5.0)))
+    cb_config.max_consecutive_losses = int(storage.get_setting(
+        "risk.max_consecutive_losses", cb_config.max_consecutive_losses))
+    cb_config.magic_number = int(storage.get_setting(
+        "risk.magic_number", cb_config.magic_number))
 
     print(f"✅ Connected to MT5 Account: {acc.login} | Mode: {acc.trade_mode} | Balance: ${acc.balance:,.2f}", flush=True)
-    print(f"🧯 Risk caps: max daily loss ${cb_config.max_daily_loss_usd:,.2f} (10% of balance) | "
-          f"max {cb_config.max_consecutive_losses} consecutive losses", flush=True)
+    print(f"🧯 Risk caps: max daily loss ${cb_config.max_daily_loss_usd:,.2f} | "
+          f"max {cb_config.max_consecutive_losses} consecutive losses | "
+          f"magic {cb_config.magic_number}", flush=True)
 
     # Sanity-check position sizing against the strategy's own stop distances.
     # At the 0.01 broker minimum, gold risks $1 per $1 of stop, so a wide stop

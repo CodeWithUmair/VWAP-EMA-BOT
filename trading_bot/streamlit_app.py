@@ -232,7 +232,43 @@ def _check_row(n: int, title: str, passed: bool, detail: str):
     )
 
 
-def _render_param_controls(strategy):
+# --------------------------------------------------------------------------
+# Sidebar persistence.
+#
+# Streamlit rebuilds every widget from scratch on each rerun, so a widget whose
+# value comes from a literal default silently discards whatever the user typed
+# the moment the page refreshes. Every control that changes how the bot trades
+# is therefore backed by the SQLite settings table: the stored value seeds the
+# widget, and any change is written straight back. The headless engine reads
+# the same table, so a change here reaches the trader without a restart.
+# --------------------------------------------------------------------------
+
+def _remember(storage, setting_key, current, previous):
+    """Persist a widget's value when it actually changed."""
+    if current != previous:
+        try:
+            storage.set_setting(setting_key, current)
+        except Exception:
+            # A locked DB must never take the dashboard down; the value simply
+            # stays for this session and is re-saved on the next interaction.
+            pass
+    return current
+
+
+def _persisted_number(storage, setting_key, label, lo, hi, default, step, **kw):
+    saved = storage.get_setting(setting_key, default)
+    cast = float if isinstance(default, float) else int
+    try:
+        saved = cast(saved)
+    except (TypeError, ValueError):
+        saved = cast(default)
+    saved = min(max(saved, cast(lo)), cast(hi))
+    value = st.sidebar.number_input(label, cast(lo), cast(hi), saved, cast(step),
+                                    key=f"set_{setting_key}", **kw)
+    return _remember(storage, setting_key, value, saved)
+
+
+def _render_param_controls(strategy, storage=None):
     """Build the sidebar tunables from the selected strategy's own declarations.
 
     Each strategy publishes a list of ParamSpecs, so adding a knob to a strategy
@@ -242,28 +278,49 @@ def _render_param_controls(strategy):
     values = {}
     for spec in strategy.param_specs():
         widget_key = f"p_{strategy.key}_{spec.key}"
+        # Settings are namespaced per strategy, so tuning one never leaks into
+        # another and each keeps its own remembered values.
+        setting_key = f"param.{strategy.key}.{spec.key}"
+        saved = storage.get_setting(setting_key, spec.default) if storage else spec.default
+
         if spec.kind == "toggle":
-            values[spec.key] = st.sidebar.toggle(
-                spec.label, value=bool(spec.default), key=widget_key, help=spec.help or None)
+            prev = bool(saved)
+            values[spec.key] = _remember(storage, setting_key, st.sidebar.toggle(
+                spec.label, value=prev, key=widget_key, help=spec.help or None), prev)                 if storage else st.sidebar.toggle(
+                    spec.label, value=prev, key=widget_key, help=spec.help or None)
         elif spec.kind == "select":
             options = spec.options or []
-            index = options.index(spec.default) if spec.default in options else 0
-            values[spec.key] = st.sidebar.selectbox(
-                spec.label, options, index=index, key=widget_key, help=spec.help or None)
+            prev = saved if saved in options else spec.default
+            index = options.index(prev) if prev in options else 0
+            chosen = st.sidebar.selectbox(spec.label, options, index=index,
+                                          key=widget_key, help=spec.help or None)
+            values[spec.key] = _remember(storage, setting_key, chosen, prev) if storage else chosen
         elif spec.kind == "slider":
-            values[spec.key] = st.sidebar.slider(
+            try:
+                prev = float(saved)
+            except (TypeError, ValueError):
+                prev = float(spec.default)
+            prev = min(max(prev, float(spec.min_value)), float(spec.max_value))
+            chosen = st.sidebar.slider(
                 spec.label, float(spec.min_value), float(spec.max_value),
-                float(spec.default), float(spec.step or 0.1),
-                key=widget_key, help=spec.help or None)
+                prev, float(spec.step or 0.1), key=widget_key, help=spec.help or None)
+            values[spec.key] = _remember(storage, setting_key, chosen, prev) if storage else chosen
         elif spec.kind == "text":
-            values[spec.key] = st.sidebar.text_input(
-                spec.label, value=str(spec.default), key=widget_key, help=spec.help or None)
+            prev = str(saved if saved is not None else spec.default)
+            chosen = st.sidebar.text_input(spec.label, value=prev, key=widget_key,
+                                           help=spec.help or None)
+            values[spec.key] = _remember(storage, setting_key, chosen, prev) if storage else chosen
         else:  # "number"
-            is_float = isinstance(spec.default, float)
-            cast = float if is_float else int
-            values[spec.key] = st.sidebar.number_input(
-                spec.label, cast(spec.min_value), cast(spec.max_value), cast(spec.default),
+            cast = float if isinstance(spec.default, float) else int
+            try:
+                prev = cast(saved)
+            except (TypeError, ValueError):
+                prev = cast(spec.default)
+            prev = min(max(prev, cast(spec.min_value)), cast(spec.max_value))
+            chosen = st.sidebar.number_input(
+                spec.label, cast(spec.min_value), cast(spec.max_value), prev,
                 cast(spec.step or 1), key=widget_key, help=spec.help or None)
+            values[spec.key] = _remember(storage, setting_key, chosen, prev) if storage else chosen
     return values
 
 
@@ -465,7 +522,7 @@ def main():
 
     st.sidebar.markdown("---")
     st.sidebar.header("⚙️ Strategy Parameters")
-    param_values = _render_param_controls(strategy)
+    param_values = _render_param_controls(strategy, storage)
     params = strategy.build_params(param_values)
 
     st.sidebar.markdown("---")
@@ -475,11 +532,14 @@ def main():
     # larger than the entire account on a small balance - i.e. no cap at all.
     _bal = st.session_state.get("acct_balance_hint", 0.0) or 0.0
     _default_daily = round(max(_bal * 0.10, 5.0), 2) if _bal else 20.0
-    max_daily_loss = st.sidebar.number_input(
-        "Max Daily Loss ($)", 5.0, 1000.0, min(_default_daily, 1000.0), step=5.0,
+    max_daily_loss = _persisted_number(
+        storage, "risk.max_daily_loss_usd", "Max Daily Loss ($)",
+        5.0, 1000.0, min(_default_daily, 1000.0), 5.0,
         help="Engine stops trading for the day past this loss. Defaults to 10% of balance.")
-    max_consec_losses = st.sidebar.number_input("Max Consec Losses", 1, 10, 3)
-    magic_num = st.sidebar.number_input("Magic Number", 100000, 9999999, 9212001)
+    max_consec_losses = _persisted_number(
+        storage, "risk.max_consecutive_losses", "Max Consec Losses", 1, 10, 3, 1)
+    magic_num = _persisted_number(
+        storage, "risk.magic_number", "Magic Number", 100000, 9999999, 9212001, 1)
 
     cb_manager.config.max_daily_loss_usd = max_daily_loss
     cb_manager.config.max_consecutive_losses = max_consec_losses
