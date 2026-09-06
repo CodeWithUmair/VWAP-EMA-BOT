@@ -191,13 +191,29 @@ def _inject_theme():
     st.markdown(_THEME_CSS, unsafe_allow_html=True)
 
 
-def _hero():
+# One-line subtitle per strategy, so the banner describes what is actually armed.
+_HERO_BLURBS = {
+    "vwap_ema_scalper": "Session VWAP &middot; EMA 9/21 crossover &middot; causal order blocks "
+                        "&middot; pullback &middot; candle confirmation",
+    "crt_body_soup": "H1 candle range &middot; body-close liquidity sweep &middot; "
+                     "confirmation trigger &middot; H4 trend bias &middot; equilibrium + far-side targets",
+    "crt_tbs": "H1 candle range &middot; wick sweep &middot; close back inside &middot; "
+               "equilibrium + far-side targets",
+}
+
+
+def _hero(strategy=None):
+    """Banner for whichever strategy is selected - never a hard-coded name."""
+    if strategy is None:
+        title, blurb = "XAU / USD &middot; MT5 Trading Bot", "Select a strategy in the sidebar"
+    else:
+        title = f"XAU / USD &middot; {html.escape(strategy.label)}"
+        blurb = _HERO_BLURBS.get(strategy.key, html.escape(strategy.description))
     st.markdown(
         '<div class="gx-hero">'
         '<div class="gx-badge">🏆</div>'
-        '<div><h1>XAU / USD &middot; 1-Minute Triple-Filter Scalper</h1>'
-        '<p>Session VWAP &middot; EMA 9/21 crossover &middot; causal order blocks &middot; '
-        'pullback &middot; candle confirmation</p></div>'
+        f'<div><h1>{title}</h1>'
+        f'<p>{blurb}</p></div>'
         '</div>',
         unsafe_allow_html=True,
     )
@@ -396,7 +412,7 @@ def main():
         return
 
     st.set_page_config(
-        page_title="XAU/USD Triple Filter Scalper MT5",
+        page_title="XAU/USD MT5 Trading Bot",
         page_icon="🏆",
         layout="wide",
         initial_sidebar_state="expanded"
@@ -418,8 +434,6 @@ def main():
     # Ensure noise gate bypass is always active for demo testing
     cb_manager.config.bypass_noise_gate_for_demo = True
     mt5_bridge = st.session_state.mt5_bridge
-
-    _hero()
 
     # SIDEBAR: Strategy selection, parameters & safety controls
     #
@@ -446,6 +460,9 @@ def main():
 
     st.sidebar.caption(f"**{strategy.timeframe}** · {strategy.description}")
 
+    # Banner comes after the picker so it can name the live strategy.
+    _hero(strategy)
+
     st.sidebar.markdown("---")
     st.sidebar.header("⚙️ Strategy Parameters")
     param_values = _render_param_controls(strategy)
@@ -453,7 +470,14 @@ def main():
 
     st.sidebar.markdown("---")
     st.sidebar.header("🛡️ Safety & Circuit Breakers")
-    max_daily_loss = st.sidebar.number_input("Max Daily Loss ($)", 50.0, 1000.0, 200.0)
+    # Default to 10% of the live balance so this agrees with the headless
+    # engine, which scales its own cap the same way. A fixed $200 default was
+    # larger than the entire account on a small balance - i.e. no cap at all.
+    _bal = st.session_state.get("acct_balance_hint", 0.0) or 0.0
+    _default_daily = round(max(_bal * 0.10, 5.0), 2) if _bal else 20.0
+    max_daily_loss = st.sidebar.number_input(
+        "Max Daily Loss ($)", 5.0, 1000.0, min(_default_daily, 1000.0), step=5.0,
+        help="Engine stops trading for the day past this loss. Defaults to 10% of balance.")
     max_consec_losses = st.sidebar.number_input("Max Consec Losses", 1, 10, 3)
     magic_num = st.sidebar.number_input("Magic Number", 100000, 9999999, 9212001)
 
@@ -477,6 +501,9 @@ def main():
 
     # Check terminal & account status
     acc = mt5_bridge.get_account_info()
+    # Cache the balance for the sidebar, which renders before this runs and so
+    # can only size its default risk caps from the previous pass.
+    st.session_state.acct_balance_hint = acc.balance
     if hasattr(mt5_bridge, "is_algo_trading_enabled"):
         algo_enabled = mt5_bridge.is_algo_trading_enabled()
     elif hasattr(mt5_bridge, "is_algo_trading_allowed"):
@@ -573,7 +600,7 @@ def main():
                     unsafe_allow_html=True,
                 )
             else:
-                st.info("📌 No open position — the engine will take the next valid 5/5 signal.")
+                st.info(f"📌 No open position — the engine will take the next valid {long_st.step_count}/{long_st.step_count} signal.")
 
         with sc3, st.container(key="gx_autotrade"):
             auto_trade_on = storage.get_setting("auto_trade_enabled", True)
@@ -581,7 +608,7 @@ def main():
                 "Auto-Trade",
                 value=auto_trade_on,
                 key="auto_trade_enabled_toggle",
-                help="ON: the headless engine opens trades on its own 5/5 signals. "
+                help="ON: the headless engine opens trades on its own full-checklist signals. "
                      "OFF: it keeps managing any open position (break-even, P&L) but "
                      "won't open new ones — use the Manual Order Dispatch buttons below instead.",
             )
@@ -818,7 +845,7 @@ def main():
         # evaluation's `context`, so this panel follows the picker instead of
         # hard-coding one strategy's indicators.
         ctx = long_st.context or {}
-        if strategy.key == "crt_tbs":
+        if ctx.get("crt_high") is not None or strategy.key.startswith("crt_"):
             st.write("The CRT range from the last completed reference candle, and where price sits in it.")
             if ctx.get("crt_high") is not None:
                 m1, m2, m3, m4 = st.columns(4)
