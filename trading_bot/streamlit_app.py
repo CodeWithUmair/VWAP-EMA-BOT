@@ -600,7 +600,8 @@ def main():
                     unsafe_allow_html=True,
                 )
             else:
-                st.info(f"📌 No open position — the engine will take the next valid {long_st.step_count}/{long_st.step_count} signal.")
+                st.info("📌 No open position — the engine will take the next signal "
+                        "that passes every check.")
 
         with sc3, st.container(key="gx_autotrade"):
             auto_trade_on = storage.get_setting("auto_trade_enabled", True)
