@@ -419,6 +419,67 @@ class MT5Bridge:
                 })
         return closed
 
+    def close_position_partial(self, ticket: int, fraction: float = 0.5) -> Tuple[bool, str]:
+        """Close part of an open position — used to bank TP1 on two-target strategies.
+
+        Returns ``(closed, reason)``. A partial close is simply a deal in the
+        opposite direction against the same position ticket, so it needs at least
+        two broker minimum lots to split: at 0.01 lots there is nothing to halve,
+        and the caller is told so rather than being left to guess why nothing
+        happened.
+        """
+        positions = self.get_open_positions()
+        pos = next((p for p in positions if p["ticket"] == ticket), None)
+        if pos is None:
+            return False, f"position {ticket} not found"
+
+        sym_info = self.get_symbol_info()
+        step = sym_info.volume_step or 0.01
+        raw = pos["volume"] * fraction
+        # Round down to a whole number of volume steps the broker will accept.
+        close_vol = round(int(raw / step) * step, 8)
+
+        if close_vol < sym_info.volume_min or (pos["volume"] - close_vol) < sym_info.volume_min:
+            return False, (f"volume {pos['volume']} cannot be split at the broker minimum "
+                           f"{sym_info.volume_min} — moving to break-even instead")
+
+        if self.is_simulation or not MT5_AVAILABLE or not self.is_connected:
+            self.sim_positions[ticket]["volume"] = round(pos["volume"] - close_vol, 8)
+            return True, f"Simulated partial close of {close_vol} lots on {ticket}"
+
+        close_type = mt5.ORDER_TYPE_SELL if pos["direction"] == "BUY" else mt5.ORDER_TYPE_BUY
+        price = sym_info.bid if pos["direction"] == "BUY" else sym_info.ask
+
+        filling_mode = mt5.ORDER_FILLING_IOC
+        raw_sym = mt5.symbol_info(self.symbol)
+        if raw_sym is not None and hasattr(raw_sym, "filling_mode"):
+            if raw_sym.filling_mode & 1:
+                filling_mode = mt5.ORDER_FILLING_FOK
+            elif raw_sym.filling_mode & 2:
+                filling_mode = mt5.ORDER_FILLING_IOC
+            else:
+                filling_mode = mt5.ORDER_FILLING_RETURN
+
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": self.symbol,
+            "volume": float(close_vol),
+            "type": close_type,
+            "position": int(ticket),
+            "price": float(price),
+            "deviation": 20,
+            "magic": int(pos.get("magic") or self.magic_number),
+            "comment": "TP1_partial",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": filling_mode,
+        }
+        res = mt5.order_send(request)
+        if res is None:
+            return False, f"order_send returned None: {mt5.last_error()}"
+        if res.retcode != mt5.TRADE_RETCODE_DONE:
+            return False, f"partial close rejected (retcode {res.retcode}): {res.comment}"
+        return True, f"Closed {close_vol} lots of {ticket} at {res.price}"
+
     def modify_position_sl(self, ticket: int, new_sl: float) -> bool:
         """Modifies Stop Loss of an active position (e.g., for Break-Even)."""
         if self.is_simulation or not MT5_AVAILABLE or not self.is_connected:

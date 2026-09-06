@@ -15,13 +15,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 
-from trading_bot.strategy import (
-    StrategyParameters,
-    evaluate_checklist_at_bar,
-    calculate_ema,
-    calculate_session_vwap,
-    calculate_atr
-)
+from trading_bot.strategies import DEFAULT_STRATEGY_KEY, get_strategy
+from trading_bot.strategy import StrategyParameters
 
 
 @dataclass
@@ -51,6 +46,11 @@ class Trade:
     duration_bars: int = 0
     pattern_name: str = ""
     is_out_of_sample: bool = False
+    # Two-target strategies (CRT + TBS): half off at TP1, stop to break-even.
+    take_profit_1: Optional[float] = None
+    tp1_hit: bool = False
+    tp1_bar: Optional[int] = None
+    partial_pnl_usd: float = 0.0
 
 
 @dataclass
@@ -96,6 +96,54 @@ class BacktestResult:
     timeframe: str = "M1"
     spread_points: float = 0.25
     commission_per_lot_usd: float = 7.0
+    strategy_key: str = DEFAULT_STRATEGY_KEY
+    strategy_label: str = ""
+
+
+# Share of the position banked when a two-target strategy tags TP1.
+TP1_CLOSE_FRACTION = 0.5
+
+
+def _finalize_trade(
+    trade: Trade,
+    exit_bar: int,
+    exit_time: str,
+    exit_price: float,
+    exit_reason: str,
+    spread_points: float,
+    commission_per_lot_usd: float
+) -> None:
+    """Book the closing leg of a trade and stamp its PnL fields, in place.
+
+    Gold PnL: 1.0 point on 0.1 lot = $10.00, i.e. point_diff * (lot_size * 100).
+    When TP1 already banked half the position, only the remainder rides to this
+    exit; the partial is added back in as gross. Commission is charged once, on
+    the full opened volume.
+    """
+    trade.exit_bar = exit_bar
+    trade.exit_time = exit_time
+    trade.exit_price = exit_price
+    trade.exit_reason = exit_reason
+    trade.duration_bars = exit_bar - trade.entry_bar + 1
+
+    point_multiplier = trade.lot_size * 100.0
+    remaining = (1.0 - TP1_CLOSE_FRACTION) if trade.tp1_hit else 1.0
+
+    pts_diff = (exit_price - trade.entry_price) if trade.direction == "BUY" \
+        else (trade.entry_price - exit_price)
+
+    gross_pnl = trade.partial_pnl_usd + pts_diff * point_multiplier * remaining
+    comm_usd = commission_per_lot_usd * trade.lot_size
+    net_pnl = gross_pnl - comm_usd
+
+    # R-multiple = Net PnL / Initial Risk USD (always the full-size risk taken on).
+    initial_risk_usd = max(trade.risk_points * point_multiplier + comm_usd, 1.0)
+
+    trade.gross_pnl_usd = round(gross_pnl, 2)
+    trade.net_pnl_usd = round(net_pnl, 2)
+    trade.commission_paid_usd = round(comm_usd, 2)
+    trade.spread_paid_usd = round(spread_points * point_multiplier, 2)
+    trade.pnl_r_multiple = round(net_pnl / initial_risk_usd, 2)
 
 
 def run_noise_control_gate(
@@ -278,33 +326,36 @@ def run_causal_backtest(
     commission_per_lot_usd: float = 7.0, # $7 round turn commission per standard lot
     fixed_lot_size: float = 0.1,  # 0.1 lot = $10 per point on Gold
     max_open_positions: int = 1,
-    num_noise_shuffles: int = 100
+    num_noise_shuffles: int = 100,
+    strategy: Any = None,          # BaseStrategy; defaults to the VWAP/EMA scalper
+    max_trade_bars: int = 0        # 0 = hold until SL/TP/end of data
 ) -> BacktestResult:
     """
     Executes a causal, zero-lookahead backtest across historical bars.
-    
+
     Causal Guarantee:
     - Checklist evaluated on bar i.
     - Signal recorded at bar i close.
     - Filled at bar i+1 Open.
     - Exit evaluated on bar i+1 and beyond wicks.
+
+    ``strategy`` is any object implementing the BaseStrategy interface from
+    :mod:`trading_bot.strategies`. It is prepared once (indicators, higher-
+    timeframe candles) and then asked for a verdict at each bar, so swapping in
+    the CRT + TBS sweep strategy costs nothing here beyond the argument.
     """
     n = len(closes)
     if n < 50:
         raise ValueError(f"Insufficient historical bars for backtest (got {n}, need at least 50)")
 
-    # Pre-calculate indicator arrays for performance
-    ema9 = calculate_ema(closes, params.ema_fast_period)
-    ema21 = calculate_ema(closes, params.ema_slow_period)
-    vwap = calculate_session_vwap(times, highs, lows, closes, volumes, params.vwap_anchor_hour_utc)
-    atr = calculate_atr(highs, lows, closes, params.atr_period)
+    if strategy is None:
+        strategy = get_strategy(DEFAULT_STRATEGY_KEY)
 
-    cached_ind = {
-        "ema9": ema9,
-        "ema21": ema21,
-        "vwap": vwap,
-        "atr": atr
+    data = {
+        "opens": opens, "highs": highs, "lows": lows,
+        "closes": closes, "times": times, "volumes": volumes,
     }
+    strategy_ctx = strategy.prepare(data, params)
 
     split_idx = int(n * split_ratio)
     trades: List[Trade] = []
@@ -322,8 +373,9 @@ def run_causal_backtest(
         "is_out_of_sample": False
     }]
 
-    # Start loop after enough warm-up bars for indicators & swings
-    warmup = max(params.ema_slow_period, params.atr_period, params.ob_swing_lookback * 3) + 5
+    # Start loop after enough warm-up bars for whatever the strategy needs
+    # (indicators and swings for the scalper, whole reference candles for CRT).
+    warmup = min(max(strategy.warmup_bars(params), 5), max(n - 2, 5))
 
     for i in range(warmup, n):
         c_open = opens[i]
@@ -340,6 +392,7 @@ def run_causal_backtest(
             pattern = sig["pattern"]
             sl = sig["sl"]
             tp = sig["tp"]
+            tp1 = sig.get("tp1")
 
             if direction == "BUY":
                 fill_price = c_open + spread_points
@@ -360,7 +413,8 @@ def run_causal_backtest(
                         reward_points=reward_pts,
                         lot_size=fixed_lot_size,
                         pattern_name=pattern,
-                        is_out_of_sample=is_oos
+                        is_out_of_sample=is_oos,
+                        take_profit_1=tp1
                     )
                     trade_id_counter += 1
             elif direction == "SELL":
@@ -382,7 +436,8 @@ def run_causal_backtest(
                         reward_points=reward_pts,
                         lot_size=fixed_lot_size,
                         pattern_name=pattern,
-                        is_out_of_sample=is_oos
+                        is_out_of_sample=is_oos,
+                        take_profit_1=tp1
                     )
                     trade_id_counter += 1
 
@@ -394,68 +449,64 @@ def run_causal_backtest(
             # For SELL: SL hit if High + spread >= SL, TP hit if Low + spread <= TP
             hit_sl = False
             hit_tp = False
+            hit_tp1 = False
             exit_price = 0.0
             exit_reason = ""
+            tp1 = open_trade.take_profit_1
 
             if open_trade.direction == "BUY":
                 if c_low <= open_trade.stop_loss:
                     hit_sl = True
                     exit_price = open_trade.stop_loss
-                    exit_reason = "STOP_LOSS"
+                    exit_reason = "BREAK_EVEN" if open_trade.tp1_hit else "STOP_LOSS"
                 elif c_high >= open_trade.take_profit:
                     hit_tp = True
                     exit_price = open_trade.take_profit
                     exit_reason = "TAKE_PROFIT"
+                elif tp1 and not open_trade.tp1_hit and c_high >= tp1:
+                    hit_tp1 = True
             elif open_trade.direction == "SELL":
                 if (c_high + spread_points) >= open_trade.stop_loss:
                     hit_sl = True
                     exit_price = open_trade.stop_loss
-                    exit_reason = "STOP_LOSS"
+                    exit_reason = "BREAK_EVEN" if open_trade.tp1_hit else "STOP_LOSS"
                 elif (c_low + spread_points) <= open_trade.take_profit:
                     hit_tp = True
                     exit_price = open_trade.take_profit
                     exit_reason = "TAKE_PROFIT"
+                elif tp1 and not open_trade.tp1_hit and (c_low + spread_points) <= tp1:
+                    hit_tp1 = True
+
+            # Two-target management: bank half at TP1 (CRT equilibrium) and pull the
+            # stop to entry, so the runner to TP2 can no longer turn into a loss.
+            # SL is tested first above, so a bar that reaches both is booked as the
+            # stop - the pessimistic reading, since intrabar order is unknowable.
+            if hit_tp1:
+                open_trade.tp1_hit = True
+                open_trade.tp1_bar = i
+                point_multiplier = open_trade.lot_size * 100.0
+                pts = (tp1 - open_trade.entry_price) if open_trade.direction == "BUY" \
+                    else (open_trade.entry_price - tp1)
+                open_trade.partial_pnl_usd = round(pts * point_multiplier * TP1_CLOSE_FRACTION, 2)
+                open_trade.stop_loss = open_trade.entry_price
 
             if hit_sl or hit_tp:
-                # Close trade
-                open_trade.exit_bar = i
-                open_trade.exit_time = c_time
-                open_trade.exit_price = exit_price
-                open_trade.exit_reason = exit_reason
-                open_trade.duration_bars = i - open_trade.entry_bar + 1
-
-                # Calculate PnL (Gold: 1.0 point on 0.1 lot = $10.00; 1.0 point on 1.0 lot = $100.00)
-                # Formula: point_diff * (lot_size * 100)
-                point_multiplier = open_trade.lot_size * 100.0
-                if open_trade.direction == "BUY":
-                    pts_diff = exit_price - open_trade.entry_price
-                else:
-                    pts_diff = open_trade.entry_price - exit_price
-
-                gross_pnl = pts_diff * point_multiplier
-                comm_usd = commission_per_lot_usd * open_trade.lot_size
-                spread_usd = spread_points * point_multiplier
-                net_pnl = gross_pnl - comm_usd
-
-                # R-multiple = Net PnL / Initial Risk USD
-                initial_risk_usd = max(open_trade.risk_points * point_multiplier + comm_usd, 1.0)
-                r_mult = net_pnl / initial_risk_usd
-
-                open_trade.gross_pnl_usd = round(gross_pnl, 2)
-                open_trade.net_pnl_usd = round(net_pnl, 2)
-                open_trade.commission_paid_usd = round(comm_usd, 2)
-                open_trade.spread_paid_usd = round(spread_usd, 2)
-                open_trade.pnl_r_multiple = round(r_mult, 2)
-
+                _finalize_trade(open_trade, i, c_time, exit_price, exit_reason,
+                                spread_points, commission_per_lot_usd)
                 trades.append(open_trade)
-                equity += net_pnl
+                equity += open_trade.net_pnl_usd
+                open_trade = None
+
+            elif max_trade_bars and (i - open_trade.entry_bar) >= max_trade_bars:
+                _finalize_trade(open_trade, i, c_time, c_close, "TIMEOUT",
+                                spread_points, commission_per_lot_usd)
+                trades.append(open_trade)
+                equity += open_trade.net_pnl_usd
                 open_trade = None
 
         # 3. EVALUATE STRATEGY AT BAR CLOSE (FOR NEXT BAR FILL)
         if open_trade is None and pending_signal is None and i < n - 1:
-            checklist = evaluate_checklist_at_bar(
-                opens, highs, lows, closes, times, volumes, i, params, cached_indicators=cached_ind
-            )
+            checklist = strategy.evaluate(data, i, params, strategy_ctx)
             long_st = checklist["LONG"]
             short_st = checklist["SHORT"]
 
@@ -466,6 +517,7 @@ def run_causal_backtest(
                     "time": c_time,
                     "sl": long_st.suggested_sl,
                     "tp": long_st.suggested_tp,
+                    "tp1": long_st.suggested_tp1,
                     "pattern": long_st.pattern_name
                 }
             elif short_st.all_passed:
@@ -475,6 +527,7 @@ def run_causal_backtest(
                     "time": c_time,
                     "sl": short_st.suggested_sl,
                     "tp": short_st.suggested_tp,
+                    "tp1": short_st.suggested_tp1,
                     "pattern": short_st.pattern_name
                 }
 
@@ -490,22 +543,10 @@ def run_causal_backtest(
 
     # Close any remaining open trade at end of data
     if open_trade is not None:
-        open_trade.exit_bar = n - 1
-        open_trade.exit_time = times[-1] if times else str(n - 1)
-        open_trade.exit_price = closes[-1]
-        open_trade.exit_reason = "END_OF_DATA"
-        open_trade.duration_bars = n - 1 - open_trade.entry_bar + 1
-        point_multiplier = open_trade.lot_size * 100.0
-        pts_diff = (closes[-1] - open_trade.entry_price) if open_trade.direction == "BUY" else (open_trade.entry_price - closes[-1])
-        gross_pnl = pts_diff * point_multiplier
-        comm_usd = commission_per_lot_usd * open_trade.lot_size
-        net_pnl = gross_pnl - comm_usd
-        initial_risk_usd = max(open_trade.risk_points * point_multiplier + comm_usd, 1.0)
-        open_trade.gross_pnl_usd = round(gross_pnl, 2)
-        open_trade.net_pnl_usd = round(net_pnl, 2)
-        open_trade.pnl_r_multiple = round(net_pnl / initial_risk_usd, 2)
+        _finalize_trade(open_trade, n - 1, times[-1] if times else str(n - 1),
+                        closes[-1], "END_OF_DATA", spread_points, commission_per_lot_usd)
         trades.append(open_trade)
-        equity += net_pnl
+        equity += open_trade.net_pnl_usd
 
     # Partition trades into In-Sample and Out-of-Sample
     is_trades = [t for t in trades if not t.is_out_of_sample]
@@ -526,7 +567,9 @@ def run_causal_backtest(
         initial_balance=initial_balance,
         final_balance=round(equity, 2),
         symbol="XAUUSD",
-        timeframe="M1",
+        timeframe=getattr(strategy, "timeframe", "M1"),
         spread_points=spread_points,
-        commission_per_lot_usd=commission_per_lot_usd
+        commission_per_lot_usd=commission_per_lot_usd,
+        strategy_key=getattr(strategy, "key", DEFAULT_STRATEGY_KEY),
+        strategy_label=getattr(strategy, "label", "")
     )

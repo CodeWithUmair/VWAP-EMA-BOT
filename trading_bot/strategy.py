@@ -44,7 +44,7 @@ class StrategyParameters:
     pinbar_nose_ratio: float = 0.5      # Nose ratio (ZAROORI)
 
     # 6. Exit & Risk:Reward Settings
-    rr_ratio: float = 1.5               # Risk:Reward Ratio (1:1.5)
+    rr_ratio: float = 2.0               # Risk:Reward Ratio (1:2.0) - raised from 1.5: a $2.50/trade spread cost needs a bigger win to forgive it, and 1:2.0 tests far above breakeven win rate on real data vs 1:1.5 sitting right on the knife edge
     sl_lookback_bars: int = 8           # Lookback bars for recent swing low/high
     sl_buffer_atr: float = 0.50         # Extra cushion beyond swing in ATR (breathing room)
     min_sl_distance_points: float = 1.8  # Minimum SL in USD ($1.80 on Gold to avoid noise)

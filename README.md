@@ -1,10 +1,30 @@
-# 🏆 XAU/USD Triple Filter EMA 9/21 + VWAP Scalping Bot (MetaTrader 5 & Streamlit)
+# 🏆 XAU/USD Multi-Strategy Trading Bot (MetaTrader 5 & Streamlit)
 
-A local, high-frequency scalping trading bot built for **XAU/USD (Gold)** on the **1-minute (M1) timeframe**, implementing strict causality, zero-lookahead backtesting, Monte Carlo noise-control statistical significance gating, and MetaTrader 5 live execution guardrails.
+A local trading bot for **XAU/USD (Gold)** built around a swappable strategy
+layer, implementing strict causality, zero-lookahead backtesting, Monte Carlo
+noise-control statistical significance gating, and MetaTrader 5 live execution
+guardrails. Two strategies ship today:
+
+- **VWAP + EMA 9/21 Scalper** (`trading_bot/strategies/vwap_ema_scalper.py`) —
+  the original M1 scalper documented below: many trades, tight stops, small
+  targets.
+- **CRT + TBS Liquidity Sweep** (`trading_bot/strategies/crt_tbs.py`) — a swing
+  setup that waits for price to sweep a completed H1/H4 candle's high or low
+  and reject back inside, then rides to the opposite side of the range. Few
+  trades, wide stops, long holds. Spec: [`trading_bot/strategies/CRT_TBS_Strategy_XAUUSD.md`](trading_bot/strategies/CRT_TBS_Strategy_XAUUSD.md).
+
+Both are selectable from the dashboard sidebar, from the CLI (`--strategy`),
+and by the headless live engine — see [`trading_bot/strategies/`](trading_bot/strategies/)
+and the [MT5 backtest guide](docs/MT5_BACKTEST_GUIDE.md). Adding a new
+strategy means adding one module there; it does not touch the engine, the
+dashboard, or the backtester.
 
 ---
 
-## 📖 Strategy Architecture & Rule Decisions
+## 📖 VWAP + EMA Scalper: Architecture & Rule Decisions
+
+*(This section documents the original scalper. For the CRT + TBS setup, see its
+own spec linked above.)*
 
 The strategy implements a 5-step causal sequence. Every single ambiguous rule has been formalized into a causal mathematical model with named, tunable parameters.
 
@@ -102,12 +122,24 @@ python trading_bot/run_tests.py
 
 ### 4. Run Backtest & Verify Noise Gate
 ```bash
-python trading_bot/run_backtest.py
+python -m trading_bot.run_backtest --strategy vwap_ema_scalper --real --bars 50000
+python -m trading_bot.run_backtest --strategy crt_tbs --real --bars 50000
 ```
+See [`docs/MT5_BACKTEST_GUIDE.md`](docs/MT5_BACKTEST_GUIDE.md) for real-data
+backtesting (Python and MT5 Strategy Tester) and a parameter sweep tool
+(`python -m trading_bot.run_sweep`).
 
 ### 5. Launch Streamlit Live Dashboard
 ```bash
 streamlit run trading_bot/streamlit_app.py
+```
+Pick the active strategy from the sidebar's **🧠 Strategy** panel — the choice
+also drives which strategy the headless live engine trades (below).
+
+### 6. Run the Headless Live Engine (optional)
+```bash
+python -m trading_bot.run_live_auto_bot                    # follows the dashboard's strategy pick
+python -m trading_bot.run_live_auto_bot --strategy crt_tbs  # pin one explicitly
 ```
 
 ---
@@ -116,20 +148,33 @@ streamlit run trading_bot/streamlit_app.py
 ```
 ├── README.md                      # Complete documentation & math specs
 ├── requirements.txt               # Python dependencies
+├── docs/
+│   └── MT5_BACKTEST_GUIDE.md      # Real-data backtesting: Python + MT5 Strategy Tester
+├── mql5/
+│   └── CRT_TBS_XAUUSD.mq5         # MT5 Expert Advisor port of the CRT + TBS strategy
 ├── trading_bot/
 │   ├── __init__.py                # Package root
-│   ├── strategy.py                # Indicators, Order Blocks, 5-Step Checklist
-│   ├── backtest.py                # Causal backtest engine & metrics
+│   ├── strategies/                # Swappable strategy layer (add a strategy here)
+│   │   ├── base.py                # BaseStrategy contract, HTF candle folding
+│   │   ├── vwap_ema_scalper.py    # Adapter for the M1 scalper below
+│   │   ├── crt_tbs.py             # CRT + TBS liquidity-sweep swing strategy
+│   │   ├── CRT_TBS_Strategy_XAUUSD.md      # CRT + TBS spec
+│   │   └── VWAP_EMA_Scalper_Strategy.md    # Scalper spec
+│   ├── strategy.py                # Scalper indicators, Order Blocks, 5-Step Checklist
+│   ├── backtest.py                # Strategy-agnostic causal backtest engine & metrics
 │   ├── circuit_breakers.py        # Daily loss & demo guardrails
 │   ├── mt5_bridge.py              # MT5 terminal connector & simulation fallback
 │   ├── storage.py                 # SQLite persistence layer
-│   ├── data_feed.py               # Gold market simulator & data loader
+│   ├── data_feed.py               # Gold market simulator & real-data loaders
 │   ├── run_tests.py               # Unit test runner
-│   ├── run_backtest.py            # CLI backtest runner & gate output
+│   ├── run_backtest.py            # CLI backtest runner & gate output (--strategy)
+│   ├── run_sweep.py               # Parameter sweep across a strategy's grid
+│   ├── run_live_auto_bot.py       # Headless MT5 live engine (--strategy)
 │   ├── streamlit_app.py           # Streamlit desktop live dashboard
 │   └── tests/                     # Hand-crafted unit tests
 │       ├── test_strategy.py       # Indicator & pattern unit tests
 │       ├── test_backtest.py       # Causal execution & noise gate tests
+│       ├── test_crt_tbs.py        # CRT + TBS sweep/reentry & HTF folding tests
 │       └── test_circuit_breakers.py # Safety & guardrail tests
 └── server.ts                      # Web preview server for AI Studio
 ```

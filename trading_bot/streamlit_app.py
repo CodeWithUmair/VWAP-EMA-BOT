@@ -28,6 +28,7 @@ from trading_bot.strategy import (
     calculate_sl_tp,
     detect_order_blocks_causal
 )
+from trading_bot.strategies import DEFAULT_STRATEGY_KEY, list_strategies
 from trading_bot.backtest import run_causal_backtest
 from trading_bot.circuit_breakers import CircuitBreakerConfig, CircuitBreakerManager
 from trading_bot.storage import BotStorage
@@ -215,6 +216,56 @@ def _check_row(n: int, title: str, passed: bool, detail: str):
     )
 
 
+def _render_param_controls(strategy):
+    """Build the sidebar tunables from the selected strategy's own declarations.
+
+    Each strategy publishes a list of ParamSpecs, so adding a knob to a strategy
+    puts it on the sidebar without touching this file. Widget keys are namespaced
+    per strategy so switching strategies never carries one's values into another.
+    """
+    values = {}
+    for spec in strategy.param_specs():
+        widget_key = f"p_{strategy.key}_{spec.key}"
+        if spec.kind == "toggle":
+            values[spec.key] = st.sidebar.toggle(
+                spec.label, value=bool(spec.default), key=widget_key, help=spec.help or None)
+        elif spec.kind == "select":
+            options = spec.options or []
+            index = options.index(spec.default) if spec.default in options else 0
+            values[spec.key] = st.sidebar.selectbox(
+                spec.label, options, index=index, key=widget_key, help=spec.help or None)
+        elif spec.kind == "slider":
+            values[spec.key] = st.sidebar.slider(
+                spec.label, float(spec.min_value), float(spec.max_value),
+                float(spec.default), float(spec.step or 0.1),
+                key=widget_key, help=spec.help or None)
+        elif spec.kind == "text":
+            values[spec.key] = st.sidebar.text_input(
+                spec.label, value=str(spec.default), key=widget_key, help=spec.help or None)
+        else:  # "number"
+            is_float = isinstance(spec.default, float)
+            cast = float if is_float else int
+            values[spec.key] = st.sidebar.number_input(
+                spec.label, cast(spec.min_value), cast(spec.max_value), cast(spec.default),
+                cast(spec.step or 1), key=widget_key, help=spec.help or None)
+    return values
+
+
+def _render_checklist(evaluation):
+    """Render whatever checks the active strategy reported, in its own order."""
+    for n, step in enumerate(evaluation.steps, start=1):
+        _check_row(n, step.name, step.passed, step.detail)
+
+
+def _levels_caption(evaluation):
+    """One-line SL / TP summary, including TP1 for two-target strategies."""
+    parts = [f"SL: **${evaluation.suggested_sl:.2f}**"]
+    if evaluation.suggested_tp1:
+        parts.append(f"TP1 (equilibrium): **${evaluation.suggested_tp1:.2f}**")
+    parts.append(f"TP{'2' if evaluation.suggested_tp1 else ''}: **${evaluation.suggested_tp:.2f}**")
+    return "  |  ".join(parts)
+
+
 def _f(v, fmt="{:.2f}", dash="—"):
     """Format a possibly-None numeric cell."""
     try:
@@ -370,31 +421,35 @@ def main():
 
     _hero()
 
-    # SIDEBAR: Parameters & Safety Controls
-    st.sidebar.header("⚙️ Strategy Parameters")
-    ema_fast = st.sidebar.number_input("EMA Fast Period", 3, 50, 9)
-    ema_slow = st.sidebar.number_input("EMA Slow Period", 5, 200, 21)
-    vwap_hour = st.sidebar.selectbox("VWAP Reset (UTC Hour)", [0, 7, 13], index=0, help="00:00 UTC Daily Open")
-    ob_swing_lb = st.sidebar.number_input("OB Swing Lookback (Pivots)", 2, 20, 3)
-    ob_max_age = st.sidebar.number_input("OB Max Age (Bars)", 10, 100, 60)
-    max_pb_bars = st.sidebar.number_input("Max Pullback Bars Post-Cross", 3, 50, 35)
-    pb_atr_mult = st.sidebar.slider("Pullback Proximity (x ATR)", 0.2, 3.0, 1.8, 0.1)
-    rr_ratio = st.sidebar.number_input("Risk:Reward Ratio", 1.0, 5.0, 1.5, 0.5)
-    sl_lookback = st.sidebar.number_input("SL Swing Lookback", 3, 30, 8)
-    sl_buffer = st.sidebar.slider("SL Buffer (x ATR)", 0.0, 1.0, 0.20, 0.05)
+    # SIDEBAR: Strategy selection, parameters & safety controls
+    #
+    # The picker is the first thing in the sidebar because everything under it —
+    # the tunables, the checklist, the backtest, and which engine the headless
+    # bot runs — follows from it. The choice is written to SQLite so the live
+    # engine (a separate process) picks up the same strategy on its next loop.
+    strategies = list_strategies()
+    saved_key = storage.get_setting("active_strategy", DEFAULT_STRATEGY_KEY)
+    keys = [s.key for s in strategies]
+    start_index = keys.index(saved_key) if saved_key in keys else 0
 
-    params = StrategyParameters(
-        ema_fast_period=ema_fast,
-        ema_slow_period=ema_slow,
-        vwap_anchor_hour_utc=vwap_hour,
-        ob_swing_lookback=ob_swing_lb,
-        ob_max_age_bars=ob_max_age,
-        max_pullback_bars=max_pb_bars,
-        pullback_atr_mult=pb_atr_mult,
-        rr_ratio=rr_ratio,
-        sl_lookback_bars=sl_lookback,
-        sl_buffer_atr=sl_buffer
+    st.sidebar.header("🧠 Strategy")
+    chosen_label = st.sidebar.radio(
+        "Active strategy",
+        [s.label for s in strategies],
+        index=start_index,
+        key="strategy_picker",
+        help="Switches the live checklist, the backtest and the headless auto-engine.",
     )
+    strategy = next(s for s in strategies if s.label == chosen_label)
+    if strategy.key != saved_key:
+        storage.set_setting("active_strategy", strategy.key)
+
+    st.sidebar.caption(f"**{strategy.timeframe}** · {strategy.description}")
+
+    st.sidebar.markdown("---")
+    st.sidebar.header("⚙️ Strategy Parameters")
+    param_values = _render_param_controls(strategy)
+    params = strategy.build_params(param_values)
 
     st.sidebar.markdown("---")
     st.sidebar.header("🛡️ Safety & Circuit Breakers")
@@ -540,17 +595,18 @@ def main():
     # Tabs
     tab1, tab2, tab3, tab4 = st.tabs(["📋 Live Setup Checklist", "📊 Causal Backtest & Noise Gate", "📈 Live Market & Indicators", "📜 Trade Logs & SQLite"])
 
-    # Evaluate current bar checklist on LIVE MT5 data
+    # Evaluate the current bar through whichever strategy is selected.
+    live_data = {"opens": opens, "highs": highs, "lows": lows,
+                 "closes": closes, "times": times, "volumes": volumes}
     curr_idx = len(closes) - 1
-    checklist = evaluate_checklist_at_bar(
-        opens, highs, lows, closes,
-        times, volumes, curr_idx, params
-    )
+    checklist = strategy.evaluate(live_data, curr_idx, params,
+                                  strategy.prepare(live_data, params))
     long_st = checklist["LONG"]
     short_st = checklist["SHORT"]
 
     with tab1:
-        st.subheader("📋 5-Step Live Strategy Checklist (Latest Bar Close)")
+        st.subheader(f"📋 Live Checklist — {strategy.label} ({long_st.step_count} steps)")
+        st.caption(f"Evaluated on the latest closed bar · {strategy.timeframe}")
         
         # Noise gate banner
         if not cb_manager.state.noise_gate_verified:
@@ -562,35 +618,41 @@ def main():
 
         with c_long:
             st.markdown('<div class="gx-side buy">🟢 BUY / LONG SETUP</div>', unsafe_allow_html=True)
-            st.caption(f"Market ${long_st.close_price:.2f}  ·  Signal: {long_st.signal or 'NO SIGNAL'}")
+            st.caption(f"Market ${long_st.close_price:.2f}  ·  "
+                       f"{long_st.passed_count}/{long_st.step_count} checks  ·  "
+                       f"Signal: {long_st.signal or 'NO SIGNAL'}")
 
-            _check_row(1, "Trend filter (VWAP)", long_st.vwap_pass, long_st.vwap_detail)
-            _check_row(2, "EMA 9/21 crossover", long_st.crossover_pass, long_st.crossover_detail)
-            _check_row(3, "Order block reaction", long_st.ob_pass, long_st.ob_detail)
-            _check_row(4, "Pullback to EMAs", long_st.pullback_pass, long_st.pullback_detail)
-            _check_row(5, "Confirmation candle", long_st.confirmation_pass,
-                       f"Pattern: {long_st.pattern_name} — {long_st.confirmation_detail}")
+            _render_checklist(long_st)
 
             if long_st.all_passed:
-                st.success(f"🎯 **ALL 5 CRITERIA MET FOR BUY ENTRY**\n- Entry: ${long_st.suggested_entry:.2f}\n- Swing Low SL: ${long_st.suggested_sl:.2f} (Risk: ${long_st.risk_points:.2f})\n- TP: ${long_st.suggested_tp:.2f} (Reward: ${long_st.reward_points:.2f})")
+                tp1_line = f"\n- TP1 (equilibrium): ${long_st.suggested_tp1:.2f}" if long_st.suggested_tp1 else ""
+                st.success(
+                    f"🎯 **ALL {long_st.step_count} CRITERIA MET FOR BUY ENTRY**\n"
+                    f"- Entry: ${long_st.suggested_entry:.2f}\n"
+                    f"- SL: ${long_st.suggested_sl:.2f} (Risk: ${long_st.risk_points:.2f})"
+                    f"{tp1_line}\n"
+                    f"- Final TP: ${long_st.suggested_tp:.2f} (Reward: ${long_st.reward_points:.2f})")
             else:
-                st.caption(f"Strategy SL (Swing Low): **${long_st.suggested_sl:.2f}** | TP ({params.rr_ratio}R): **${long_st.suggested_tp:.2f}**")
+                st.caption(_levels_caption(long_st))
 
         with c_short:
             st.markdown('<div class="gx-side sell">🔴 SELL / SHORT SETUP</div>', unsafe_allow_html=True)
-            st.caption(f"Market ${short_st.close_price:.2f}  ·  Signal: {short_st.signal or 'NO SIGNAL'}")
+            st.caption(f"Market ${short_st.close_price:.2f}  ·  "
+                       f"{short_st.passed_count}/{short_st.step_count} checks  ·  "
+                       f"Signal: {short_st.signal or 'NO SIGNAL'}")
 
-            _check_row(1, "Trend filter (VWAP)", short_st.vwap_pass, short_st.vwap_detail)
-            _check_row(2, "EMA 9/21 crossover", short_st.crossover_pass, short_st.crossover_detail)
-            _check_row(3, "Order block reaction", short_st.ob_pass, short_st.ob_detail)
-            _check_row(4, "Pullback to EMAs", short_st.pullback_pass, short_st.pullback_detail)
-            _check_row(5, "Confirmation candle", short_st.confirmation_pass,
-                       f"Pattern: {short_st.pattern_name} — {short_st.confirmation_detail}")
+            _render_checklist(short_st)
 
             if short_st.all_passed:
-                st.error(f"🎯 **ALL 5 CRITERIA MET FOR SELL ENTRY**\n- Entry: ${short_st.suggested_entry:.2f}\n- Swing High SL: ${short_st.suggested_sl:.2f} (Risk: ${short_st.risk_points:.2f})\n- TP: ${short_st.suggested_tp:.2f} (Reward: ${short_st.reward_points:.2f})")
+                tp1_line = f"\n- TP1 (equilibrium): ${short_st.suggested_tp1:.2f}" if short_st.suggested_tp1 else ""
+                st.error(
+                    f"🎯 **ALL {short_st.step_count} CRITERIA MET FOR SELL ENTRY**\n"
+                    f"- Entry: ${short_st.suggested_entry:.2f}\n"
+                    f"- SL: ${short_st.suggested_sl:.2f} (Risk: ${short_st.risk_points:.2f})"
+                    f"{tp1_line}\n"
+                    f"- Final TP: ${short_st.suggested_tp:.2f} (Reward: ${short_st.reward_points:.2f})")
             else:
-                st.caption(f"Strategy SL (Swing High): **${short_st.suggested_sl:.2f}** | TP ({params.rr_ratio}R): **${short_st.suggested_tp:.2f}**")
+                st.caption(_levels_caption(short_st))
 
         st.markdown("---")
         st.subheader("⚡ Manual Order Dispatch")
@@ -613,7 +675,7 @@ def main():
                     sl_price=long_st.suggested_sl,
                     tp_price=long_st.suggested_tp,
                     magic_number=magic_num,
-                    comment="TripleFilter_BUY"
+                    comment=f"{strategy.key[:12]}_BUY"
                 )
                 if ok:
                     st.success(msg)
@@ -639,7 +701,7 @@ def main():
                     sl_price=short_st.suggested_sl,
                     tp_price=short_st.suggested_tp,
                     magic_number=magic_num,
-                    comment="TripleFilter_SELL"
+                    comment=f"{strategy.key[:12]}_SELL"
                 )
                 if ok:
                     st.success(msg)
@@ -670,16 +732,37 @@ def main():
     with tab2:
         st.subheader("📊 Causal Backtesting & Noise-Control Monte Carlo Gate")
         st.write("Strict zero-lookahead backtest with separate In-Sample (75%) vs Out-of-Sample (25%) splits and 100-shuffle Monte Carlo noise testing.")
+        st.caption(f"Testing: **{strategy.label}** with the sidebar parameters.")
 
-        bt_bars = st.slider("Historical Bars to Test", 500, 3000, 1500, 100, key="slider_bt_bars")
+        bt_source = st.radio(
+            "Price data",
+            ["Live MT5 history (real)", "Synthetic random walk"],
+            horizontal=True,
+            key="radio_bt_source",
+            help="Real M1 bars pulled from the running terminal are the only ones "
+                 "whose result means anything. The random walk only exercises the plumbing.",
+        )
+        bt_bars = st.slider("Historical Bars to Test", 500, 50000, 5000, 500, key="slider_bt_bars")
         if st.button("▶️ Execute Full Backtest & Gate Verification", key="btn_run_full_backtest"):
             with st.spinner("Running causal simulation and permutation tests..."):
-                bt_data = generate_realistic_gold_data(num_bars=bt_bars, seed=101)
+                if bt_source.startswith("Live"):
+                    try:
+                        bt_data = mt5_bridge.fetch_recent_bars(count=bt_bars, timeframe_str="M1")
+                    except Exception as exc:
+                        bt_data = None
+                        st.error(f"Could not pull M1 history from MT5: {exc}")
+                    if not bt_data or len(bt_data.get("closes", [])) < 200:
+                        st.warning("MT5 returned too little M1 history — falling back to synthetic bars. "
+                                   "Open an M1 chart for the symbol and scroll back to force a download.")
+                        bt_data = generate_realistic_gold_data(num_bars=bt_bars, seed=101)
+                else:
+                    bt_data = generate_realistic_gold_data(num_bars=bt_bars, seed=101)
+
                 res = run_causal_backtest(
                     bt_data["opens"], bt_data["highs"], bt_data["lows"], bt_data["closes"],
                     bt_data["times"], bt_data["volumes"], params,
                     initial_balance=10000.0, split_ratio=0.75, spread_points=sym_info.spread_usd,
-                    num_noise_shuffles=100
+                    num_noise_shuffles=100, strategy=strategy
                 )
                 st.session_state.bt_result = res
                 cb_manager.set_noise_gate_status(
@@ -730,12 +813,41 @@ def main():
 
     with tab3:
         st.subheader("📈 Live Market & Indicators")
-        st.write("Visualized indicator values, Order Blocks, and VWAP levels.")
-        ema9_vals = calculate_ema(closes, 9)
-        ema21_vals = calculate_ema(closes, 21)
-        vwap_vals = calculate_session_vwap(times, highs, lows, closes, volumes, params.vwap_anchor_hour_utc)
-        
-        st.write(f"Latest 1m Bar Close: **${closes[-1]:.2f}** | EMA9: **${ema9_vals[-1]:.2f}** | EMA21: **${ema21_vals[-1]:.2f}** | VWAP: **${vwap_vals[-1]:.2f}**")
+
+        # Every strategy reports the levels it actually trades off in the
+        # evaluation's `context`, so this panel follows the picker instead of
+        # hard-coding one strategy's indicators.
+        ctx = long_st.context or {}
+        if strategy.key == "crt_tbs":
+            st.write("The CRT range from the last completed reference candle, and where price sits in it.")
+            if ctx.get("crt_high") is not None:
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("CRT High (BSL)", f"${ctx['crt_high']:.2f}")
+                m2.metric("CRT Equilibrium", f"${ctx['crt_eq']:.2f}")
+                m3.metric("CRT Low (SSL)", f"${ctx['crt_low']:.2f}")
+                m4.metric("Range", f"${ctx['crt_high'] - ctx['crt_low']:.2f}")
+                st.caption(f"Reference candle opened {ctx.get('crt_start', '—')} · "
+                           f"latest close ${closes[-1]:.2f}")
+            else:
+                st.info("Waiting for a completed reference candle — pull more history "
+                        "or give the terminal a moment.")
+        else:
+            st.write("Visualized indicator values, Order Blocks, and VWAP levels.")
+            ema9_vals = calculate_ema(closes, params.ema_fast_period)
+            ema21_vals = calculate_ema(closes, params.ema_slow_period)
+            vwap_vals = calculate_session_vwap(times, highs, lows, closes, volumes,
+                                               params.vwap_anchor_hour_utc)
+            st.write(f"Latest 1m Bar Close: **${closes[-1]:.2f}** | EMA9: **${ema9_vals[-1]:.2f}** "
+                     f"| EMA21: **${ema21_vals[-1]:.2f}** | VWAP: **${vwap_vals[-1]:.2f}**")
+
+        with st.expander(f"📄 {strategy.label} — full strategy spec"):
+            doc = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "strategies", strategy.doc_file)
+            if os.path.exists(doc):
+                with open(doc, "r", encoding="utf-8") as fh:
+                    st.markdown(fh.read())
+            else:
+                st.caption(f"Spec file not found: {doc}")
 
     with tab4:
         st.subheader("📜 Trade History")

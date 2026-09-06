@@ -1,13 +1,25 @@
 """
-Autonomous Institutional-Grade Live Scalper Engine for MT5 (XAUUSD M1).
-Features:
-1. Multi-Timeframe Trend Filter (M15 EMA 50 alignment prevents counter-trend traps)
+Autonomous live trading engine for MT5 (XAUUSD).
+
+Runs whichever strategy is selected in :mod:`trading_bot.strategies` - the M1
+VWAP/EMA scalper or the CRT + TBS liquidity-sweep swing setup - against the same
+M1 feed. Pick one with ``--strategy``, or leave it off and the engine follows the
+dashboard sidebar (both processes read ``active_strategy`` from SQLite).
+
+Shared risk machinery, applied whatever the strategy:
+1. Multi-Timeframe Trend Filter (M15 EMA 50 alignment; scalper only by default)
 2. Institutional Killzone Tracker (London & New York high-volume momentum)
 3. Smart Dynamic ATR-Buffered SL & TP (Minimum $1.80 breathing room prevents stop-hunting)
 4. Dynamic Auto Break-Even Shield (locks +$2.50, capped at 40% of target, once 60% of the way to TP)
-5. Single Active Position Enforcement (Prevents dangerous stacking/over-leveraging)
-6. Post-Loss Cooling Guard (3-minute circuit pause prevents revenge whipsaws)
-7. Configurable 0.01 Micro-Lot Size & Expanded $500 Daily Loss Limit
+5. TP1 handling for two-target strategies (half off at CRT equilibrium, stop to entry)
+6. Single Active Position Enforcement (Prevents dangerous stacking/over-leveraging)
+7. Post-Loss Cooling Guard (3-minute circuit pause prevents revenge whipsaws)
+8. Economic-calendar blackout around high-impact releases (ForexFactory, free JSON)
+9. Circuit breakers scaled to the live account balance, not fixed dollar amounts
+
+Usage:
+    python -m trading_bot.run_live_auto_bot
+    python -m trading_bot.run_live_auto_bot --strategy crt_tbs
 """
 
 import time
@@ -19,7 +31,18 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
+# This engine logs with emoji status markers. On Windows the console defaults to
+# cp1252, which cannot encode them - and the crash only appears once output is
+# piped to a file, i.e. exactly how a long-running bot is usually launched.
+# Force UTF-8 and degrade unencodable characters rather than dying mid-session.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 from trading_bot.mt5_bridge import MT5Bridge
+from trading_bot.strategies import DEFAULT_STRATEGY_KEY, REGISTRY, get_strategy
 from trading_bot.strategy import (
     StrategyParameters,
     evaluate_checklist_at_bar,
@@ -29,38 +52,82 @@ from trading_bot.strategy import (
     is_in_killzone
 )
 from trading_bot.circuit_breakers import CircuitBreakerConfig, CircuitBreakerManager
+from trading_bot.news_filter import build_filter
 from trading_bot.storage import BotStorage
 
 
-def run_live_auto_trading():
-    print("=" * 85, flush=True)
-    print("🚀 STARTING INSTITUTIONAL PRO SCALPER ENGINE (XAUUSD M1)", flush=True)
-    print("🛡️ ACTIVE CONFLUENCES: M15 Trend Align | Break-Even Shield | Smart ATR Buffer", flush=True)
-    print("=" * 85, flush=True)
+# Per-strategy live tuning, layered over each strategy's shipped defaults.
+LIVE_PARAM_OVERRIDES = {
+    "vwap_ema_scalper": {
+        "max_pullback_bars": 35,         # Realistic pullback window
+        "ob_buffer_atr": 0.35,           # Clean Order Block retest zone
+        "pullback_atr_mult": 1.8,        # Proximity to EMA 9/21 zone
+        "rr_ratio": 2.0,                 # 1:2.0 Risk:Reward (raised from 1.5 - spread/commission cost was eating the edge at 1.5)
+        "sl_buffer_atr": 0.50,           # 0.5 ATR cushion beyond swing pivots
+        "min_sl_distance_points": 1.8,   # Minimum $1.80 SL on Gold to survive wicks
+        "max_sl_distance_points": 6.0,   # Max $6.00 SL on Gold
+        "enable_htf_filter": True,       # Strictly trade with M15 macro trend
+        "enable_session_filter": False,  # Set True to ONLY trade London/NY Killzones
+    },
+    # CRT + TBS ships its own killzone and range filters, so its defaults stand.
+    "crt_tbs": {},
+    "crt_body_soup": {
+        # Bias ON is the only configuration that tested above break-even on the
+        # broker's own bars (PF 1.15, ~1.8 trades/day). It did NOT hold on the
+        # independent Dukascopy set, which is exactly why this is a demo
+        # forward-test and not a funded strategy - see docs/MT5_BACKTEST_GUIDE.md.
+        "enable_htf_bias": True,
+        "htf_bias_tf": "H4",
+    },
+}
 
-    # Strategy Parameters
-    params = StrategyParameters()
-    params.max_pullback_bars = 35        # Realistic pullback window
-    params.ob_buffer_atr = 0.35          # Clean Order Block retest zone
-    params.pullback_atr_mult = 1.8       # Proximity to EMA 9/21 zone
-    params.rr_ratio = 1.5                # 1:1.5 Risk:Reward
-    params.sl_buffer_atr = 0.50          # 0.5 ATR cushion beyond swing pivots
-    params.min_sl_distance_points = 1.8  # Minimum $1.80 SL on Gold to survive wicks
-    params.max_sl_distance_points = 6.0  # Max $6.00 SL on Gold
-    params.enable_htf_filter = True      # Strictly trade with M15 macro trend
-    params.enable_session_filter = False # Set True to ONLY trade London/NY Killzones
+
+def resolve_strategy(storage, cli_key=None):
+    """Pick the strategy this run trades: CLI flag, else the dashboard's choice.
+
+    The dashboard writes ``active_strategy`` to SQLite when you switch strategies
+    in the sidebar, so the two processes stay in step without any IPC. A CLI flag
+    wins, and pins the engine regardless of what the dashboard says.
+    """
+    if cli_key:
+        return get_strategy(cli_key), "command line"
+    try:
+        saved = storage.get_setting("active_strategy", DEFAULT_STRATEGY_KEY)
+    except Exception:
+        saved = DEFAULT_STRATEGY_KEY
+    return get_strategy(saved), "dashboard sidebar"
+
+
+def run_live_auto_trading(strategy_key: str = None):
+    storage = BotStorage()
+    strategy, chosen_via = resolve_strategy(storage, strategy_key)
+
+    params = strategy.build_params({
+        **{s.key: s.default for s in strategy.param_specs()},
+        **LIVE_PARAM_OVERRIDES.get(strategy.key, {}),
+    })
+
+    print("=" * 85, flush=True)
+    print(f"🚀 STARTING LIVE ENGINE — {strategy.label.upper()} ({strategy.timeframe})", flush=True)
+    print(f"   {strategy.description}", flush=True)
+    print(f"   Strategy selected via: {chosen_via}", flush=True)
+    print("🛡️ ACTIVE SHIELDS: Single Position | Break-Even Shield | Post-Loss Cooldown", flush=True)
+    print("=" * 85, flush=True)
 
     # Trading Volume & Risk Settings
     trade_lot_size = 0.01                # Micro-lot 0.01 for safe scaling and testing
 
+    # Circuit breakers are sized from the LIVE balance, not a fixed dollar
+    # figure. A $500 daily-loss ceiling on a $100 account is not a safety net -
+    # it lets the account reach zero five times over before it trips. These
+    # scale, so the same numbers stay meaningful whatever the balance is.
     cb_config = CircuitBreakerConfig(
         bypass_noise_gate_for_demo=True,
-        max_consecutive_losses=6,        # Relaxed consecutive loss count
-        max_daily_loss_usd=500.0,        # Increased daily loss ceiling ($500.00)
+        max_consecutive_losses=3,
+        max_daily_loss_usd=50.0,         # replaced below once the balance is known
         cooldown_after_loss_minutes=3
     )
     cb_manager = CircuitBreakerManager(config=cb_config)
-    storage = BotStorage()
     mt5_bridge = MT5Bridge(symbol="XAUUSDm")
 
     if not mt5_bridge.connect():
@@ -70,17 +137,52 @@ def run_live_auto_trading():
     acc = mt5_bridge.get_account_info()
     algo_allowed = mt5_bridge.is_algo_trading_enabled()
 
+    # Daily loss ceiling = 10% of balance, floored at $5 so tiny accounts still trade.
+    cb_config.max_daily_loss_usd = max(round(acc.balance * 0.10, 2), 5.0)
+
     print(f"✅ Connected to MT5 Account: {acc.login} | Mode: {acc.trade_mode} | Balance: ${acc.balance:,.2f}", flush=True)
+    print(f"🧯 Risk caps: max daily loss ${cb_config.max_daily_loss_usd:,.2f} (10% of balance) | "
+          f"max {cb_config.max_consecutive_losses} consecutive losses", flush=True)
+
+    # Sanity-check position sizing against the strategy's own stop distances.
+    # At the 0.01 broker minimum, gold risks $1 per $1 of stop, so a wide stop
+    # on a small account is a large percentage loss - say so plainly at startup.
+    worst_sl = getattr(params, "max_sl_distance_points", 0) or 0
+    if worst_sl and acc.balance > 0:
+        worst_pct = (worst_sl * trade_lot_size * 100.0) / acc.balance * 100.0
+        if worst_pct > 3.0:
+            print(f"⚠️  SIZING WARNING: a worst-case ${worst_sl:.2f} stop at {trade_lot_size} lots "
+                  f"risks {worst_pct:.1f}% of this balance on ONE trade (1-2% is normal). "
+                  f"This account is small for this strategy at the minimum lot size.",
+                  flush=True)
     print(f"⚡ Target Symbol: {mt5_bridge.symbol} | Default Lot Size: {trade_lot_size} | Algo Allowed: {algo_allowed}", flush=True)
     print("⚡ Auto-Scanner active. Streaming live ticks every 3 seconds...\n", flush=True)
 
     last_evaluated_time = 0
+    last_news_log = 0
     last_loss_time = 0
     start_session_time = int(time.time())
     processed_deal_tickets = set()
     be_moved_tickets = set()
     pos_tp = {}       # ticket -> take-profit price, snapshotted while the position is open
     be_lock = {}      # ticket -> shield stop price, set when the profit shield arms
+    pos_tp1 = {}      # ticket -> TP1 price for two-target strategies (CRT equilibrium)
+    tp1_done = set()  # tickets whose TP1 has already been banked / shielded
+
+    # Economic-calendar blackout. Gold's worst fills happen in the minutes around
+    # NFP/CPI/FOMC: spreads gap, stops slip, and a clean-looking sweep is really
+    # just the release. Fetched from ForexFactory's free public JSON (no API key
+    # exists or is needed) and refreshed periodically; a fetch failure falls back
+    # to the on-disk cache rather than dropping the guard silently.
+    NEWS_REFRESH_SECONDS = 6 * 3600
+    news = build_filter(fetch_live=True, minutes_before=30, minutes_after=30)
+    last_news_refresh = time.time()
+    if news.is_active:
+        print(f"📰 News filter ON: {len(news)} high-impact events loaded "
+              f"(blocking +/-30 min around each).", flush=True)
+    else:
+        print("📰 News filter: NO events loaded - trading unguarded against releases. "
+              "Run `python -m trading_bot.news_filter` to populate the cache.", flush=True)
 
     # Profit-shield tuning: arm once 60% of the way to TP, lock in up to $2.50 of price
     # (capped at 40% of the target so tight-target trades keep a buffer to current price).
@@ -105,6 +207,19 @@ def run_live_auto_trading():
             except Exception:
                 pass
 
+            # Keep the calendar current. Never let a network hiccup stop trading:
+            # on failure the previous event list stays in force.
+            if time.time() - last_news_refresh > NEWS_REFRESH_SECONDS:
+                last_news_refresh = time.time()
+                try:
+                    refreshed = build_filter(fetch_live=True, minutes_before=30, minutes_after=30)
+                    if refreshed.is_active:
+                        news = refreshed
+                        print(f"📰 News calendar refreshed: {len(news)} events.", flush=True)
+                except Exception as exc:
+                    print(f"📰 News refresh failed ({exc}); keeping the existing calendar.",
+                          flush=True)
+
             # 1. Fetch live open positions and apply the profit shield
 
             open_positions = mt5_bridge.get_open_positions()
@@ -118,6 +233,28 @@ def run_live_auto_trading():
                 sl = pos["sl"]
                 tp = pos["tp"]
                 pos_tp[ticket] = tp
+
+                # TP1 management for two-target strategies (CRT + TBS): at the CRT
+                # equilibrium, bank half and pull the stop to entry. At 0.01 lots
+                # there is nothing to halve, so the bridge says so and the trade
+                # simply goes risk-free on the full size instead.
+                tp1 = pos_tp1.get(ticket)
+                if tp1 and ticket not in tp1_done:
+                    reached = (current_p >= tp1) if direction == "BUY" else (current_p <= tp1)
+                    if reached:
+                        tp1_done.add(ticket)
+                        ok, why = mt5_bridge.close_position_partial(ticket, fraction=0.5)
+                        if ok:
+                            print(f"💰 [TP1 BANKED] {direction} {ticket} took half off at "
+                                  f"${tp1:.2f} (CRT equilibrium). {why}", flush=True)
+                        else:
+                            print(f"ℹ️ [TP1 REACHED] {direction} {ticket} at ${tp1:.2f} — "
+                                  f"no partial taken ({why}).", flush=True)
+                        if mt5_bridge.modify_position_sl(ticket, entry_p):
+                            be_moved_tickets.add(ticket)
+                            be_lock[ticket] = entry_p
+                            print(f"🔒 [BREAK-EVEN] {ticket} stop moved to entry ${entry_p:.2f}; "
+                                  f"runner rides to TP2 ${tp:.2f}.", flush=True)
 
                 # Arm the profit shield once the trade is SHIELD_ARM_FRAC of the way to TP
                 if ticket not in be_moved_tickets and tp > 0 and sl > 0:
@@ -206,10 +343,13 @@ def run_live_auto_trading():
             # 5. Session Killzone Status
             in_killzone, killzone_name = is_in_killzone()
 
-            # 6. Evaluate 5-Step Checklist on M1
-            checklist = evaluate_checklist_at_bar(
-                opens, highs, lows, closes, times, volumes, curr_idx, params
-            )
+            # 6. Evaluate the active strategy's checklist on the latest closed bar.
+            #    CRT + TBS folds these M1 bars into M5/H1 internally, so the same
+            #    feed serves both strategies without the engine knowing the difference.
+            live_data = {"opens": opens, "highs": highs, "lows": lows,
+                         "closes": closes, "times": times, "volumes": volumes}
+            checklist = strategy.evaluate(live_data, curr_idx, params,
+                                          strategy.prepare(live_data, params))
             long_st = checklist["LONG"]
             short_st = checklist["SHORT"]
 
@@ -222,16 +362,18 @@ def run_live_auto_trading():
             if latest_bar.time != last_evaluated_time:
                 last_evaluated_time = latest_bar.time
 
-                buy_passed_count = sum([long_st.vwap_pass, long_st.crossover_pass, long_st.ob_pass, long_st.pullback_pass, long_st.confirmation_pass])
-                sell_passed_count = sum([short_st.vwap_pass, short_st.crossover_pass, short_st.ob_pass, short_st.pullback_pass, short_st.confirmation_pass])
+                def _summarise(ev):
+                    """One line per side, naming whatever checks this strategy defines."""
+                    return " | ".join(f"{s.name.split('(')[0].strip()}={s.passed}"
+                                      for s in ev.steps)
 
                 pos_status = f"{len(open_positions)} OPEN ({open_positions[0]['direction']})" if open_positions else "0 OPEN"
 
                 print(
                     f"\n🕯️ [{now_str} UTC | M1 CLOSE] Price: ${closes[-1]:.2f} | ATR: ${curr_atr:.2f} | Session: {killzone_name}\n"
                     f"   ├─ 🧭 M15 Macro Trend: {htf_trend} ({htf_reason})\n"
-                    f"   ├─ 🟢 BUY Setup ({buy_passed_count}/5): VWAP={long_st.vwap_pass} | Cross={long_st.crossover_pass} | OB={long_st.ob_pass} | Pullback={long_st.pullback_pass} | Candle={long_st.confirmation_pass}\n"
-                    f"   ├─ 🔴 SELL Setup ({sell_passed_count}/5): VWAP={short_st.vwap_pass} | Cross={short_st.crossover_pass} | OB={short_st.ob_pass} | Pullback={short_st.pullback_pass} | Candle={short_st.confirmation_pass}\n"
+                    f"   ├─ 🟢 BUY  ({long_st.passed_count}/{long_st.step_count}): {_summarise(long_st)}\n"
+                    f"   ├─ 🔴 SELL ({short_st.passed_count}/{short_st.step_count}): {_summarise(short_st)}\n"
                     f"   └─ 🛡️ Active Positions: {pos_status}",
                     flush=True
                 )
@@ -246,12 +388,26 @@ def run_live_auto_trading():
             if (time.time() - last_loss_time) < (cb_config.cooldown_after_loss_minutes * 60):
                 continue
 
-            # Shield 3: Dead-Market Anti-Chop Filter
-            if curr_atr < 0.45:  # Gold M1 ATR < $0.45 indicates flat range trap
+            # Shield 3: Dead-Market Anti-Chop Filter. Scalping a flat M1 range is
+            # a losing game, but a sweep strategy is *supposed* to fire into quiet
+            # ranges, so this only guards the M1 scalper.
+            if strategy.key == "vwap_ema_scalper" and curr_atr < 0.45:
                 continue
 
-            # Shield 4: Session Killzone Filter (Optional)
-            if params.enable_session_filter and not in_killzone:
+            # Shield 4: Session Killzone Filter (optional; CRT + TBS enforces its
+            # own killzone windows as a checklist step instead).
+            if getattr(params, "enable_session_filter", False) and not in_killzone:
+                continue
+
+            # Shield 4b: Economic-calendar blackout. Skip the minutes either side
+            # of a high-impact release - that is when spreads gap and stops slip,
+            # and a "sweep" is usually just the news, not a liquidity trap.
+            blocking = news.blocking_event(datetime.now(timezone.utc))
+            if blocking is not None:
+                if latest_bar.time != last_news_log:
+                    last_news_log = latest_bar.time
+                    print(f"📰 [NEWS BLACKOUT] Standing aside: {blocking.currency} "
+                          f"{blocking.title} at {blocking.when:%H:%M} UTC", flush=True)
                 continue
 
             # Shield 5: Circuit Breakers (Max consecutive losses / daily loss)
@@ -271,12 +427,13 @@ def run_live_auto_trading():
 
             # ================= EXECUTE BUY ORDER =================
             if long_st.all_passed:
-                if params.enable_htf_filter and htf_trend == "BEARISH":
+                if getattr(params, "enable_htf_filter", False) and htf_trend == "BEARISH":
                     print(f"⚠️ [FILTER BLOCKED] M1 BUY Signal skipped: M15 Macro Trend is BEARISH (Counter-trend protection)", flush=True)
                     continue
 
                 print(f"\n🎯 >>> ALL CONFLUENCES ALIGNED: EXECUTING BUY ORDER (Lot: {trade_lot_size}) AT ${sym_info.ask:.2f} <<<", flush=True)
-                print(f"   SL: ${long_st.suggested_sl:.2f} (Risk: ${long_st.risk_points:.2f}) | TP: ${long_st.suggested_tp:.2f} (Reward: ${long_st.reward_points:.2f})", flush=True)
+                tp1_note = f" | TP1: ${long_st.suggested_tp1:.2f}" if long_st.suggested_tp1 else ""
+                print(f"   SL: ${long_st.suggested_sl:.2f} (Risk: ${long_st.risk_points:.2f}){tp1_note} | TP: ${long_st.suggested_tp:.2f} (Reward: ${long_st.reward_points:.2f})", flush=True)
                 
                 res = mt5_bridge.send_order(
                     direction="BUY",
@@ -284,11 +441,13 @@ def run_live_auto_trading():
                     sl_price=long_st.suggested_sl,
                     tp_price=long_st.suggested_tp,
                     magic_number=cb_config.magic_number,
-                    comment="ProScalper_BUY"
+                    comment=f"{strategy.key[:12]}_BUY"
                 )
                 ok, ticket, msg = res if (isinstance(res, tuple) and len(res) == 3) else (False, 0, str(res))
                 if ok:
                     print(f"✅ {msg}\n", flush=True)
+                    if long_st.suggested_tp1:
+                        pos_tp1[ticket] = long_st.suggested_tp1
                     storage.record_trade({
                         "order_id": ticket,
                         "symbol": mt5_bridge.symbol,
@@ -306,12 +465,13 @@ def run_live_auto_trading():
 
             # ================= EXECUTE SELL ORDER =================
             elif short_st.all_passed:
-                if params.enable_htf_filter and htf_trend == "BULLISH":
+                if getattr(params, "enable_htf_filter", False) and htf_trend == "BULLISH":
                     print(f"⚠️ [FILTER BLOCKED] M1 SELL Signal skipped: M15 Macro Trend is BULLISH (Counter-trend protection)", flush=True)
                     continue
 
                 print(f"\n🎯 >>> ALL CONFLUENCES ALIGNED: EXECUTING SELL ORDER (Lot: {trade_lot_size}) AT ${sym_info.bid:.2f} <<<", flush=True)
-                print(f"   SL: ${short_st.suggested_sl:.2f} (Risk: ${short_st.risk_points:.2f}) | TP: ${short_st.suggested_tp:.2f} (Reward: ${short_st.reward_points:.2f})", flush=True)
+                tp1_note = f" | TP1: ${short_st.suggested_tp1:.2f}" if short_st.suggested_tp1 else ""
+                print(f"   SL: ${short_st.suggested_sl:.2f} (Risk: ${short_st.risk_points:.2f}){tp1_note} | TP: ${short_st.suggested_tp:.2f} (Reward: ${short_st.reward_points:.2f})", flush=True)
 
                 res = mt5_bridge.send_order(
                     direction="SELL",
@@ -319,11 +479,13 @@ def run_live_auto_trading():
                     sl_price=short_st.suggested_sl,
                     tp_price=short_st.suggested_tp,
                     magic_number=cb_config.magic_number,
-                    comment="ProScalper_SELL"
+                    comment=f"{strategy.key[:12]}_SELL"
                 )
                 ok, ticket, msg = res if (isinstance(res, tuple) and len(res) == 3) else (False, 0, str(res))
                 if ok:
                     print(f"✅ {msg}\n", flush=True)
+                    if short_st.suggested_tp1:
+                        pos_tp1[ticket] = short_st.suggested_tp1
                     storage.record_trade({
                         "order_id": ticket,
                         "symbol": mt5_bridge.symbol,
@@ -345,4 +507,9 @@ def run_live_auto_trading():
 
 
 if __name__ == "__main__":
-    run_live_auto_trading()
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Run the headless MT5 auto-trading engine.")
+    ap.add_argument("--strategy", choices=sorted(REGISTRY), default=None,
+                    help="pin a strategy for this run; omit to follow the dashboard sidebar")
+    run_live_auto_trading(strategy_key=ap.parse_args().strategy)

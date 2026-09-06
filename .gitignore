@@ -22,3 +22,10 @@ trading_bot_data.sqlite.bak-*
 
 # runtime DB (churns constantly; MT5 is source of truth)
 trading_bot_data.sqlite
+
+# Market data + calendar caches: large, regenerable, and machine-specific.
+# Rebuild with:
+#   python scripts/fetch_dukascopy_m1.py --from 2026-01-01 --to 2026-09-06 --out data/XAUUSD_M1_2026.csv
+#   python -m trading_bot.news_filter
+data/*.csv
+data/news_events.json
