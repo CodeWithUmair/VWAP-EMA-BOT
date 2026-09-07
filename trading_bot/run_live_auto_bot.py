@@ -13,6 +13,7 @@ Features:
 import time
 import sys
 import os
+from dataclasses import asdict
 from datetime import datetime, timezone
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -30,6 +31,33 @@ from trading_bot.strategy import (
 )
 from trading_bot.circuit_breakers import CircuitBreakerConfig, CircuitBreakerManager
 from trading_bot.storage import BotStorage
+
+
+def _in_news_blackout(windows, now_utc=None):
+    """True if now_utc falls inside any "HH:MM-HH:MM" UTC window (no midnight wrap)."""
+    now = now_utc or datetime.now(timezone.utc)
+    mins = now.hour * 60 + now.minute
+    for w in windows or []:
+        try:
+            a, b = str(w).split("-")
+            ah, am = (int(x) for x in a.split(":"))
+            bh, bm = (int(x) for x in b.split(":"))
+            if ah * 60 + am <= mins <= bh * 60 + bm:
+                return True, w
+        except Exception:
+            continue
+    return False, None
+
+
+def _bar_age_seconds(bar_time):
+    """Seconds between a bar's ISO-8601 timestamp and now (UTC). None if unparseable."""
+    try:
+        t = datetime.fromisoformat(str(bar_time))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - t).total_seconds()
+    except Exception:
+        return None
 
 
 def run_live_auto_trading():
@@ -61,6 +89,35 @@ def run_live_auto_trading():
     )
     cb_manager = CircuitBreakerManager(config=cb_config)
     storage = BotStorage()
+
+    # Honour the dashboard's "Safety & Circuit Breakers" panel (SQLite "bot_config" row).
+    # cb_manager holds cb_config by reference, so mutating it here takes effect live.
+    _cfg = storage.get_setting("bot_config", {}) or {}
+    if _cfg:
+        cb_config.max_daily_loss_usd = float(_cfg.get("max_daily_loss", cb_config.max_daily_loss_usd))
+        cb_config.max_consecutive_losses = int(_cfg.get("max_consec_losses", cb_config.max_consecutive_losses))
+        cb_config.magic_number = int(_cfg.get("magic_num", cb_config.magic_number))
+        print(f"⚙️ bot_config applied — MaxDailyLoss ${cb_config.max_daily_loss_usd:g} | "
+              f"MaxConsecLosses {cb_config.max_consecutive_losses} | Magic {cb_config.magic_number}", flush=True)
+
+    # Execution-safety knobs (questionnaire sections D / K / N). 0 disables a gate.
+    MAX_SPREAD_USD = float(_cfg.get("max_spread_usd", 0.60))     # refuse entry above this live spread
+    STALE_BAR_SECS = float(_cfg.get("stale_bar_secs", 180))      # halt entries if the feed freezes
+    NEWS_BLACKOUT = _cfg.get("news_blackout", []) or []          # list of "HH:MM-HH:MM" UTC windows
+    print(f"🛡️ Exec guards — MaxSpread ${MAX_SPREAD_USD:g} | StaleBar {STALE_BAR_SECS:g}s | "
+          f"NewsBlackout {NEWS_BLACKOUT or 'none'}", flush=True)
+
+    # Restore circuit-breaker state so a restart does not wipe the day's loss tally
+    # or the consecutive-loss count (questionnaire Q8 / Q53).
+    _saved_cb = storage.get_setting("cb_state", {}) or {}
+    if _saved_cb.get("current_date") == datetime.now(timezone.utc).strftime("%Y-%m-%d"):
+        for _k, _v in _saved_cb.items():
+            if hasattr(cb_manager.state, _k):
+                setattr(cb_manager.state, _k, _v)
+        print(f"↻ Restored circuit-breaker state — consec losses {cb_manager.state.consecutive_losses}, "
+              f"daily P&L ${cb_manager.state.daily_pnl_usd:+.2f}, "
+              f"daily-loss tripped={cb_manager.state.is_daily_loss_tripped}", flush=True)
+
     mt5_bridge = MT5Bridge(symbol="XAUUSDm")
 
     if not mt5_bridge.connect():
@@ -167,6 +224,10 @@ def run_live_auto_trading():
 
                         storage.update_closed_trade(ticket, exit_p, pnl, exit_reason=exit_reason)
                         cb_manager.record_trade_outcome(net_pnl_usd=pnl, current_balance=acc.balance)
+                        try:  # persist so a restart keeps the day's tally (Q8)
+                            storage.set_setting("cb_state", asdict(cb_manager.state))
+                        except Exception:
+                            pass
 
                         if exit_reason == "Break-Even Shield":
                             sign = "+" if pnl >= 0 else "-"
@@ -219,7 +280,8 @@ def run_live_auto_trading():
             now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
 
             # 7. Print Diagnostic Output on M1 Candle Close
-            if latest_bar.time != last_evaluated_time:
+            _new_bar = latest_bar.time != last_evaluated_time
+            if _new_bar:
                 last_evaluated_time = latest_bar.time
 
                 buy_passed_count = sum([long_st.vwap_pass, long_st.crossover_pass, long_st.ob_pass, long_st.pullback_pass, long_st.confirmation_pass])
@@ -252,6 +314,31 @@ def run_live_auto_trading():
 
             # Shield 4: Session Killzone Filter (Optional)
             if params.enable_session_filter and not in_killzone:
+                continue
+
+            # Shield 4b: Max-Spread Gate — refuse 1-minute scalps when the spread is
+            # abnormally wide (news spikes, thin liquidity). Questionnaire D19/D20.
+            if MAX_SPREAD_USD > 0 and sym_info.spread_usd > MAX_SPREAD_USD:
+                if _new_bar:
+                    print(f"⏸️  [SPREAD GUARD] Spread ${sym_info.spread_usd:.2f} > "
+                          f"${MAX_SPREAD_USD:.2f} limit — no new entries.", flush=True)
+                continue
+
+            # Shield 4c: Stale-Feed Gate — if the newest bar stopped advancing the
+            # price feed is frozen; do not trade on stale data. Questionnaire N77/N78.
+            _age = _bar_age_seconds(latest_bar.time)
+            if STALE_BAR_SECS > 0 and _age is not None and _age > STALE_BAR_SECS:
+                if _new_bar:
+                    print(f"⏸️  [STALE FEED] Newest M1 bar is {_age:.0f}s old "
+                          f"(> {STALE_BAR_SECS:.0f}s) — halting new entries.", flush=True)
+                continue
+
+            # Shield 4d: News Blackout — skip new entries inside configured
+            # high-impact-news windows (CPI / NFP / FOMC). Questionnaire C14/C15.
+            _blk, _win = _in_news_blackout(NEWS_BLACKOUT)
+            if _blk:
+                if _new_bar:
+                    print(f"⏸️  [NEWS BLACKOUT] Inside window {_win} UTC — no new entries.", flush=True)
                 continue
 
             # Shield 5: Circuit Breakers (Max consecutive losses / daily loss)
@@ -288,7 +375,11 @@ def run_live_auto_trading():
                 )
                 ok, ticket, msg = res if (isinstance(res, tuple) and len(res) == 3) else (False, 0, str(res))
                 if ok:
-                    print(f"✅ {msg}\n", flush=True)
+                    _le = dict(getattr(mt5_bridge, "last_exec", {}) or {})
+                    print(f"✅ {msg}", flush=True)
+                    print(f"   📏 spread ${_le.get('spread_paid_usd', 0):.2f} | "
+                          f"slippage ${_le.get('entry_slippage_usd', 0):+.2f} | "
+                          f"latency {_le.get('entry_latency_ms', 0):.0f}ms\n", flush=True)
                     storage.record_trade({
                         "order_id": ticket,
                         "symbol": mt5_bridge.symbol,
@@ -298,7 +389,8 @@ def run_live_auto_trading():
                         "sl": long_st.suggested_sl,
                         "tp": long_st.suggested_tp,
                         "status": "OPEN",
-                        "opened_at": datetime.now(timezone.utc).isoformat()
+                        "opened_at": datetime.now(timezone.utc).isoformat(),
+                        **_le,
                     })
                     time.sleep(60)
                 else:
@@ -323,7 +415,11 @@ def run_live_auto_trading():
                 )
                 ok, ticket, msg = res if (isinstance(res, tuple) and len(res) == 3) else (False, 0, str(res))
                 if ok:
-                    print(f"✅ {msg}\n", flush=True)
+                    _le = dict(getattr(mt5_bridge, "last_exec", {}) or {})
+                    print(f"✅ {msg}", flush=True)
+                    print(f"   📏 spread ${_le.get('spread_paid_usd', 0):.2f} | "
+                          f"slippage ${_le.get('entry_slippage_usd', 0):+.2f} | "
+                          f"latency {_le.get('entry_latency_ms', 0):.0f}ms\n", flush=True)
                     storage.record_trade({
                         "order_id": ticket,
                         "symbol": mt5_bridge.symbol,
@@ -333,7 +429,8 @@ def run_live_auto_trading():
                         "sl": short_st.suggested_sl,
                         "tp": short_st.suggested_tp,
                         "status": "OPEN",
-                        "opened_at": datetime.now(timezone.utc).isoformat()
+                        "opened_at": datetime.now(timezone.utc).isoformat(),
+                        **_le,
                     })
                     time.sleep(60)
                 else:

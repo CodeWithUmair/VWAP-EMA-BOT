@@ -68,6 +68,19 @@ class BotStorage:
                 )
             """)
 
+            # Execution-quality columns added 2026-09 (Q21/Q23/Q29 of the dev
+            # questionnaire). ALTER is idempotent-guarded so it is safe on old DBs.
+            for _col, _decl in (
+                ("requested_price", "REAL DEFAULT 0"),
+                ("fill_price", "REAL DEFAULT 0"),
+                ("entry_slippage_usd", "REAL DEFAULT 0"),
+                ("entry_latency_ms", "REAL DEFAULT 0"),
+            ):
+                try:
+                    cursor.execute(f"ALTER TABLE trades ADD COLUMN {_col} {_decl}")
+                except Exception:
+                    pass  # column already exists
+
             # 2. Settings table (key-value store)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS settings (
@@ -101,8 +114,9 @@ class BotStorage:
                     ticket, direction, entry_time, entry_price, stop_loss, take_profit,
                     lot_size, exit_time, exit_price, exit_reason, net_pnl_usd,
                     pnl_r_multiple, spread_paid_usd, commission_paid_usd, pattern_name,
-                    is_demo, magic_number, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    is_demo, magic_number, created_at,
+                    requested_price, fill_price, entry_slippage_usd, entry_latency_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 trade_data.get("ticket") or trade_data.get("order_id"),
                 trade_data.get("direction"),
@@ -121,7 +135,11 @@ class BotStorage:
                 trade_data.get("pattern_name", ""),
                 1 if trade_data.get("is_demo", True) else 0,
                 trade_data.get("magic_number", 9212001),
-                now
+                now,
+                trade_data.get("requested_price", 0.0),
+                trade_data.get("fill_price", 0.0),
+                trade_data.get("entry_slippage_usd", 0.0),
+                trade_data.get("entry_latency_ms", 0.0),
             ))
             conn.commit()
             return cursor.lastrowid

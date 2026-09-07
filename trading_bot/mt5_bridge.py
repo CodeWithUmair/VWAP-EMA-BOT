@@ -71,6 +71,9 @@ class MT5Bridge:
         self.sim_equity = 10000.0
         self.sim_positions: Dict[int, Dict[str, Any]] = {}
         self.ticket_counter = 5000000
+        # Execution details of the most recent successful send_order() call, for
+        # spread / slippage / latency logging by the caller. Reset each attempt.
+        self.last_exec: Dict[str, Any] = {}
 
     def connect(self, path: Optional[str] = None) -> Tuple[bool, str]:
         """Initializes connection to MetaTrader5 terminal."""
@@ -283,6 +286,8 @@ class MT5Bridge:
         Sends an order with rigorous safety checks. Supports both stop_loss/take_profit and sl_price/tp_price kwargs.
         Always returns a 3-tuple (bool, int, str).
         """
+        import time as _time
+        self.last_exec = {}
         try:
             sl = stop_loss if stop_loss is not None else (sl_price or 0.0)
             tp = take_profit if take_profit is not None else (tp_price or 0.0)
@@ -314,6 +319,13 @@ class MT5Bridge:
                     "open_time": datetime.now(timezone.utc).isoformat(),
                     "magic": magic,
                     "comment": comment
+                }
+                self.last_exec = {
+                    "requested_price": float(fill_price),
+                    "fill_price": float(fill_price),
+                    "entry_slippage_usd": 0.0,
+                    "entry_latency_ms": 0.0,
+                    "spread_paid_usd": float(getattr(sym_info, "spread_usd", 0.0) or 0.0),
                 }
                 return True, ticket, f"Simulated {direction} order {ticket} filled at ${fill_price:.2f} (SL: ${sl:.2f}, TP: ${tp:.2f})"
 
@@ -352,7 +364,9 @@ class MT5Bridge:
                 "type_filling": filling_mode,
             }
 
+            _t0 = _time.perf_counter()
             result = mt5.order_send(request)
+            _latency_ms = (_time.perf_counter() - _t0) * 1000.0
             if result is None:
                 err_msg = mt5.last_error() if hasattr(mt5, "last_error") else "Unknown MT5 error"
                 return False, 0, f"order_send returned None: {err_msg}"
@@ -360,6 +374,15 @@ class MT5Bridge:
             if result.retcode != mt5.TRADE_RETCODE_DONE:
                 return False, 0, f"Order rejected (retcode {result.retcode}): {result.comment}"
 
+            # Adverse slippage = fill worse than requested (higher for BUY, lower for SELL).
+            _slip = (result.price - price) if direction == "BUY" else (price - result.price)
+            self.last_exec = {
+                "requested_price": float(price),
+                "fill_price": float(result.price),
+                "entry_slippage_usd": round(float(_slip), 3),
+                "entry_latency_ms": round(_latency_ms, 1),
+                "spread_paid_usd": float(getattr(sym_info, "spread_usd", 0.0) or 0.0),
+            }
             return True, result.order, f"Order {result.order} executed successfully at {result.price} (SL: {sl_rounded}, TP: {tp_rounded})"
 
         except Exception as e:

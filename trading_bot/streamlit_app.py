@@ -282,7 +282,19 @@ def _render_trade_history(storage, mt5_bridge, magic_num, limit=100):
         pnl = lp["profit"] if lp else r.get("net_pnl_usd")
         pnl_cls = "gx-pos" if (pnl or 0) > 0 else ("gx-neg" if (pnl or 0) < 0 else "gx-mut")
         pnl_txt = _f(pnl, "{:+.2f}") if reconciled else "—"
-        r_txt = _f(r.get("pnl_r_multiple"), "{:+.2f}") if reconciled else "—"
+
+        # R-multiple: P&L (realized, or live for an open position) divided by the
+        # dollars risked from entry to the original stop. The engine leaves the
+        # stored pnl_r_multiple at 0, so compute it on the fly here.
+        r_txt = "—"
+        if reconciled and pnl is not None:
+            try:
+                _risk_usd = abs(float(r.get("entry_price")) - float(r.get("stop_loss"))) \
+                    * 100.0 * float(r.get("lot_size") or 0.01)   # XAUUSD contract = 100 oz
+                if _risk_usd > 0:
+                    r_txt = "{:+.2f}".format(pnl / _risk_usd)
+            except (TypeError, ValueError):
+                r_txt = "—"
         marker = '<span class="gx-dot"></span>' if is_open else ''
         reason_html = ('<span class="gx-tag">LIVE</span>' if is_open
                        else html.escape(str(r.get("exit_reason") or "unreconciled")))
@@ -354,7 +366,7 @@ def main():
 
     # Initialize persistence and managers in session state
     if "storage" not in st.session_state:
-        st.session_state.storage = BotStorage()
+        st.session_state.storage = BotStorage(db_path=os.path.join(BASE_DIR, "trading_bot_data.sqlite"))
     if "cb_manager" not in st.session_state:
         cb_cfg = CircuitBreakerConfig(bypass_noise_gate_for_demo=True)
         st.session_state.cb_manager = CircuitBreakerManager(config=cb_cfg)
@@ -371,17 +383,77 @@ def main():
     _hero()
 
     # SIDEBAR: Parameters & Safety Controls
+    # Persisted in the SQLite `settings` table under key "bot_config" so the sidebar
+    # survives a browser refresh / dashboard restart. session_state is seeded from the
+    # DB once per session; every field AUTO-SAVES on change via on_change=_save_bot_config
+    # (no "Save" click needed), and the button just forces a re-save.
+    bot_cfg = storage.get_setting("bot_config", {}) or {}
+    _vwh = int(bot_cfg.get("vwap_hour", 0) or 0)
+    _cfg_defaults = {
+        "cfg_ema_fast": int(bot_cfg.get("ema_fast", 9)),
+        "cfg_ema_slow": int(bot_cfg.get("ema_slow", 21)),
+        "cfg_vwap_hour": _vwh if _vwh in (0, 7, 13) else 0,
+        "cfg_ob_swing_lb": int(bot_cfg.get("ob_swing_lb", 3)),
+        "cfg_ob_max_age": int(bot_cfg.get("ob_max_age", 60)),
+        "cfg_max_pb_bars": int(bot_cfg.get("max_pb_bars", 35)),
+        "cfg_pb_atr_mult": float(bot_cfg.get("pb_atr_mult", 1.8)),
+        "cfg_rr_ratio": float(bot_cfg.get("rr_ratio", 1.5)),
+        "cfg_sl_lookback": int(bot_cfg.get("sl_lookback", 8)),
+        "cfg_sl_buffer": float(bot_cfg.get("sl_buffer", 0.20)),
+        "cfg_max_daily_loss": float(bot_cfg.get("max_daily_loss", 200.0)),
+        "cfg_max_consec_losses": int(bot_cfg.get("max_consec_losses", 3)),
+        "cfg_magic_num": int(bot_cfg.get("magic_num", 9212001)),
+        "cfg_max_spread": float(bot_cfg.get("max_spread_usd", 0.60)),
+        "cfg_stale_secs": int(bot_cfg.get("stale_bar_secs", 180)),
+        "cfg_news_blackout": ", ".join(bot_cfg.get("news_blackout", []) or []),
+    }
+    for _k, _v in _cfg_defaults.items():
+        st.session_state.setdefault(_k, _v)
+
+    def _save_bot_config():
+        ss = st.session_state
+        try:
+            ss.storage.set_setting("bot_config", {
+                "ema_fast": ss.cfg_ema_fast, "ema_slow": ss.cfg_ema_slow,
+                "vwap_hour": ss.cfg_vwap_hour, "ob_swing_lb": ss.cfg_ob_swing_lb,
+                "ob_max_age": ss.cfg_ob_max_age, "max_pb_bars": ss.cfg_max_pb_bars,
+                "pb_atr_mult": ss.cfg_pb_atr_mult, "rr_ratio": ss.cfg_rr_ratio,
+                "sl_lookback": ss.cfg_sl_lookback, "sl_buffer": ss.cfg_sl_buffer,
+                "max_daily_loss": ss.cfg_max_daily_loss,
+                "max_consec_losses": ss.cfg_max_consec_losses,
+                "magic_num": ss.cfg_magic_num,
+                "max_spread_usd": float(ss.cfg_max_spread),
+                "stale_bar_secs": int(ss.cfg_stale_secs),
+                "news_blackout": [w.strip() for w in str(ss.cfg_news_blackout).split(",") if w.strip()],
+            })
+            ss._bot_cfg_flash = ("ok", "Bot config saved to DB.")
+        except Exception as exc:  # surface a locked DB / bad value instead of failing silently
+            ss._bot_cfg_flash = ("err", f"Save failed: {exc}")
+
+    def _reset_bot_config():
+        ss = st.session_state
+        try:
+            ss.storage.set_setting("bot_config", {})
+        except Exception as exc:
+            ss._bot_cfg_flash = ("err", f"Reset failed: {exc}")
+            return
+        for _key in list(_cfg_defaults):
+            ss.pop(_key, None)
+        ss._bot_cfg_flash = ("ok", "Reverted to defaults.")
+
+    _sv = _save_bot_config   # every widget auto-saves the whole config row on change
     st.sidebar.header("⚙️ Strategy Parameters")
-    ema_fast = st.sidebar.number_input("EMA Fast Period", 3, 50, 9)
-    ema_slow = st.sidebar.number_input("EMA Slow Period", 5, 200, 21)
-    vwap_hour = st.sidebar.selectbox("VWAP Reset (UTC Hour)", [0, 7, 13], index=0, help="00:00 UTC Daily Open")
-    ob_swing_lb = st.sidebar.number_input("OB Swing Lookback (Pivots)", 2, 20, 3)
-    ob_max_age = st.sidebar.number_input("OB Max Age (Bars)", 10, 100, 60)
-    max_pb_bars = st.sidebar.number_input("Max Pullback Bars Post-Cross", 3, 50, 35)
-    pb_atr_mult = st.sidebar.slider("Pullback Proximity (x ATR)", 0.2, 3.0, 1.8, 0.1)
-    rr_ratio = st.sidebar.number_input("Risk:Reward Ratio", 1.0, 5.0, 1.5, 0.5)
-    sl_lookback = st.sidebar.number_input("SL Swing Lookback", 3, 30, 8)
-    sl_buffer = st.sidebar.slider("SL Buffer (x ATR)", 0.0, 1.0, 0.20, 0.05)
+    ema_fast = st.sidebar.number_input("EMA Fast Period", 3, 50, key="cfg_ema_fast", on_change=_sv)
+    ema_slow = st.sidebar.number_input("EMA Slow Period", 5, 200, key="cfg_ema_slow", on_change=_sv)
+    vwap_hour = st.sidebar.selectbox("VWAP Reset (UTC Hour)", [0, 7, 13],
+                                     help="00:00 UTC Daily Open", key="cfg_vwap_hour", on_change=_sv)
+    ob_swing_lb = st.sidebar.number_input("OB Swing Lookback (Pivots)", 2, 20, key="cfg_ob_swing_lb", on_change=_sv)
+    ob_max_age = st.sidebar.number_input("OB Max Age (Bars)", 10, 100, key="cfg_ob_max_age", on_change=_sv)
+    max_pb_bars = st.sidebar.number_input("Max Pullback Bars Post-Cross", 3, 50, key="cfg_max_pb_bars", on_change=_sv)
+    pb_atr_mult = st.sidebar.slider("Pullback Proximity (x ATR)", 0.2, 3.0, step=0.1, key="cfg_pb_atr_mult", on_change=_sv)
+    rr_ratio = st.sidebar.number_input("Risk:Reward Ratio", 1.0, 5.0, step=0.5, key="cfg_rr_ratio", on_change=_sv)
+    sl_lookback = st.sidebar.number_input("SL Swing Lookback", 3, 30, key="cfg_sl_lookback", on_change=_sv)
+    sl_buffer = st.sidebar.slider("SL Buffer (x ATR)", 0.0, 1.0, step=0.05, key="cfg_sl_buffer", on_change=_sv)
 
     params = StrategyParameters(
         ema_fast_period=ema_fast,
@@ -398,13 +470,43 @@ def main():
 
     st.sidebar.markdown("---")
     st.sidebar.header("🛡️ Safety & Circuit Breakers")
-    max_daily_loss = st.sidebar.number_input("Max Daily Loss ($)", 50.0, 1000.0, 200.0)
-    max_consec_losses = st.sidebar.number_input("Max Consec Losses", 1, 10, 3)
-    magic_num = st.sidebar.number_input("Magic Number", 100000, 9999999, 9212001)
+    max_daily_loss = st.sidebar.number_input("Max Daily Loss ($)", 50.0, 1000.0, key="cfg_max_daily_loss", on_change=_sv)
+    max_consec_losses = st.sidebar.number_input("Max Consec Losses", 1, 10, key="cfg_max_consec_losses", on_change=_sv)
+    magic_num = st.sidebar.number_input("Magic Number", 100000, 9999999, key="cfg_magic_num", on_change=_sv)
+    max_spread = st.sidebar.number_input("Max Spread ($, 0 = off)", 0.0, 5.0, step=0.05, key="cfg_max_spread",
+                                        on_change=_sv, help="Engine refuses new entries when the live spread exceeds this.")
+    stale_secs = st.sidebar.number_input("Stale-Feed Halt (sec, 0 = off)", 0, 600, step=30, key="cfg_stale_secs",
+                                         on_change=_sv, help="Engine halts new entries if the newest M1 bar is older than this.")
+    news_blackout = st.sidebar.text_input("News Blackout (UTC, comma-sep HH:MM-HH:MM)", key="cfg_news_blackout",
+                                          on_change=_sv, help="e.g. 12:25-12:45, 13:55-14:15 — no new entries inside these windows.")
 
     cb_manager.config.max_daily_loss_usd = max_daily_loss
     cb_manager.config.max_consecutive_losses = max_consec_losses
     cb_manager.config.magic_number = magic_num
+
+    # Save / reset the persisted sidebar config ("bot_config" row in the DB)
+    st.sidebar.markdown("---")
+    _save_col, _reset_col = st.sidebar.columns(2)
+    _save_col.button("💾 Save Config", key="btn_save_bot_config",
+                     on_click=_save_bot_config, use_container_width=True)
+    _reset_col.button("↩️ Reset Defaults", key="btn_reset_bot_config",
+                      on_click=_reset_bot_config, use_container_width=True)
+
+    _flash = st.session_state.pop("_bot_cfg_flash", None)
+    if _flash:
+        (st.sidebar.success if _flash[0] == "ok" else st.sidebar.error)(_flash[1])
+
+    _saved_cfg = storage.get_setting("bot_config", {}) or {}
+    if _saved_cfg:
+        st.sidebar.caption(
+            "💾 Saved in DB — EMA {}/{} · RR {} · MaxDaily ${:g} · MaxConsec {}".format(
+                _saved_cfg.get("ema_fast", "?"), _saved_cfg.get("ema_slow", "?"),
+                _saved_cfg.get("rr_ratio", "?"), _saved_cfg.get("max_daily_loss", 0),
+                _saved_cfg.get("max_consec_losses", "?"),
+            )
+        )
+    else:
+        st.sidebar.caption("💾 Nothing saved yet — showing defaults.")
 
     # Sidebar Manual Refresh Button
     st.sidebar.markdown("---")
@@ -741,6 +843,17 @@ def main():
         st.subheader("📜 Trade History")
         st.caption("Closed trades from the local SQLite store, plus any position open right now "
                    "(pink pulse · live P/L from MT5). Refreshes every 3s.")
+
+        # Execution-quality rollup (questionnaire Q92): avg spread / slippage / latency.
+        _all = storage.get_all_trades(500) or []
+        _exq = [t for t in _all if (t.get("fill_price") or 0)]
+        if _exq:
+            _avg = lambda k: sum(float(t.get(k) or 0) for t in _exq) / len(_exq)
+            e1, e2, e3, e4 = st.columns(4)
+            e1.metric("Avg Spread", f"${_avg('spread_paid_usd'):.3f}")
+            e2.metric("Avg Entry Slippage", f"${_avg('entry_slippage_usd'):+.3f}")
+            e3.metric("Avg Fill Latency", f"{_avg('entry_latency_ms'):.0f} ms")
+            e4.metric("Trades w/ exec data", len(_exq))
 
         @st.fragment(run_every="3s")
         def _trade_history_panel():
