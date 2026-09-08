@@ -268,6 +268,19 @@ def _persisted_number(storage, setting_key, label, lo, hi, default, step, **kw):
     return _remember(storage, setting_key, value, saved)
 
 
+def _persisted_text_list(storage, setting_key, label, default=(), **kw):
+    """A persisted sidebar text box holding a comma-separated list (e.g. manual
+    news-blackout windows). Stored as a real list under the setting key; edited
+    as one comma-separated string, same convention the rest of the app uses for
+    lists a person types by hand.
+    """
+    saved = storage.get_setting(setting_key, list(default)) or []
+    prev_text = ", ".join(str(x) for x in saved)
+    chosen_text = st.sidebar.text_input(label, value=prev_text, key=f"set_{setting_key}", **kw)
+    chosen_list = [w.strip() for w in chosen_text.split(",") if w.strip()]
+    return _remember(storage, setting_key, chosen_list, saved)
+
+
 def _render_param_controls(strategy, storage=None):
     """Build the sidebar tunables from the selected strategy's own declarations.
 
@@ -406,7 +419,20 @@ def _render_trade_history(storage, mt5_bridge, magic_num, limit=100):
         pnl = lp["profit"] if lp else r.get("net_pnl_usd")
         pnl_cls = "gx-pos" if (pnl or 0) > 0 else ("gx-neg" if (pnl or 0) < 0 else "gx-mut")
         pnl_txt = _f(pnl, "{:+.2f}") if reconciled else "—"
-        r_txt = _f(r.get("pnl_r_multiple"), "{:+.2f}") if reconciled else "—"
+
+        # R-multiple: P&L divided by dollars risked from entry to the original
+        # stop. The engine leaves pnl_r_multiple at 0 for most rows (only the
+        # backtester's Trade dataclass fills it in), so compute it live here
+        # instead of trusting a column that's usually empty.
+        r_txt = "—"
+        if reconciled and pnl is not None:
+            try:
+                _risk_usd = abs(float(r.get("entry_price")) - float(r.get("stop_loss") or r.get("sl"))) \
+                    * 100.0 * float(r.get("lot_size") or r.get("volume") or 0.01)
+                if _risk_usd > 0:
+                    r_txt = "{:+.2f}".format(pnl / _risk_usd)
+            except (TypeError, ValueError):
+                r_txt = "—"
         marker = '<span class="gx-dot"></span>' if is_open else ''
         reason_html = ('<span class="gx-tag">LIVE</span>' if is_open
                        else html.escape(str(r.get("exit_reason") or "unreconciled")))
@@ -540,6 +566,16 @@ def main():
         storage, "risk.max_consecutive_losses", "Max Consec Losses", 1, 10, 3, 1)
     magic_num = _persisted_number(
         storage, "risk.magic_number", "Magic Number", 100000, 9999999, 9212001, 1)
+    max_spread_usd = _persisted_number(
+        storage, "risk.max_spread_usd", "Max Spread ($, 0 = off)", 0.0, 5.0, 0.60, 0.05,
+        help="Engine refuses new entries when the live spread exceeds this.")
+    stale_bar_secs = _persisted_number(
+        storage, "risk.stale_bar_secs", "Stale-Feed Halt (sec, 0 = off)", 0, 600, 180, 30,
+        help="Engine halts new entries if the newest M1 bar is older than this.")
+    news_windows = _persisted_text_list(
+        storage, "risk.news_blackout_windows", "Manual News Windows (UTC, comma-sep HH:MM-HH:MM)",
+        help="e.g. 12:25-12:45, 13:55-14:15 — no new entries inside these windows. "
+             "Supplements the automatic ForexFactory calendar filter, doesn't replace it.")
 
     cb_manager.config.max_daily_loss_usd = max_daily_loss
     cb_manager.config.max_consecutive_losses = max_consec_losses

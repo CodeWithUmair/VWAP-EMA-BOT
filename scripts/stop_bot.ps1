@@ -17,26 +17,44 @@ param(
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $RunDir = Join-Path $RepoRoot ".run"
+$Python = Join-Path $RepoRoot "venv\Scripts\python.exe"
+if (-not (Test-Path $Python)) { $Python = "python" }
+$env:PYTHONPATH = $RepoRoot
 
 function Stop-ByPidFile($name, $pidFile) {
     if (-not (Test-Path $pidFile)) {
         Write-Host "    $name : no PID file, nothing to stop" -ForegroundColor DarkGray
-        return
+        return $false
     }
     $procId = Get-Content $pidFile -ErrorAction SilentlyContinue
     $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
+    $stopped = $false
     if ($proc) {
         Stop-Process -Id $procId -Force
         Write-Host "    $name : stopped (PID $procId)" -ForegroundColor Green
+        $stopped = $true
     } else {
         Write-Host "    $name : PID $procId not running (already stopped)" -ForegroundColor DarkGray
     }
     Remove-Item $pidFile -ErrorAction SilentlyContinue
+    return $stopped
 }
 
 Write-Host "==> Stopping bot processes" -ForegroundColor Cyan
-Stop-ByPidFile "Engine   " (Join-Path $RunDir "engine.pid")
-Stop-ByPidFile "Dashboard" (Join-Path $RunDir "dashboard.pid")
+$engineStopped = Stop-ByPidFile "Engine   " (Join-Path $RunDir "engine.pid")
+Stop-ByPidFile "Dashboard" (Join-Path $RunDir "dashboard.pid") | Out-Null
+
+# The heartbeat can otherwise linger "fresh" (< 20s old) for a few seconds after
+# the process is gone, which fooled start_bot.ps1's liveness check into thinking
+# a restart wasn't needed. Clear it so the next start_bot run isn't fooled.
+if ($engineStopped) {
+    $clearScript = Join-Path $RunDir "_clear_heartbeat.py"
+    @'
+from trading_bot.storage import BotStorage
+BotStorage().set_setting("engine_heartbeat", None)
+'@ | Set-Content -Encoding ascii $clearScript
+    & $Python $clearScript 2>$null
+}
 
 if ($Mt5Too) {
     $mt5 = Get-Process -Name "terminal64" -ErrorAction SilentlyContinue
