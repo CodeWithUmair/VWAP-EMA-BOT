@@ -6,8 +6,84 @@ code" constraint from the 2026-09-01 handoff **no longer applies**. The owner
 asked for a second, structurally different strategy (liquidity-sweep swing
 trades) alongside the existing M1 scalper, plus a way to pick between them.
 
-Commits, oldest first: `7e48644` → `bee36bc` → `6c508ef` → `68215a1`
-(4 commits, ~3,900 lines). Nothing pushed to `origin` yet.
+Commits, oldest first: `7e48644` → `bee36bc` → `6c508ef` → `68215a1` →
+`0b8b6df` (handoff write-up) → **`d314298` (merge — see its own section
+below, read it before touching `run_live_auto_bot.py` or `streamlit_app.py`
+again)**. Pushed to `origin/main` — this is now the shared history, not a
+local-only branch.
+
+## Addendum — reconciling with a concurrent push (`cfabc94` → `d314298`)
+
+After the work below was committed locally, `git push` was rejected:
+`origin/main` had moved. Someone else — `umairamir007`, commit `cfabc94`,
+same day — had pushed **"Live-readiness pack: exec-safety guards, CB
+persistence, config that sticks."** This was not a simple rebase situation:
+that commit fixed **the exact same "sidebar values don't persist / engine
+doesn't read them" bug this session also fixed, independently, with an
+incompatible design** (one `bot_config` dict row vs. this session's
+`param.<strategy>.<key>` / `risk.*` settings-table scheme). It touched the
+same four files this session had rewritten:
+`run_live_auto_bot.py`, `streamlit_app.py`, `storage.py`, `mt5_bridge.py`.
+
+**A plain `git merge` was attempted, and it did conflict** in
+`run_live_auto_bot.py` and `streamlit_app.py` exactly as expected (their diff
+was against the *old*, pre-strategy-registry version of both files — pre-loop
+structure, `long_st.vwap_pass`-style scalper-only fields that no longer exist
+on the generic `Evaluation` object). `storage.py` and `mt5_bridge.py`
+auto-merged cleanly — both sides were purely additive there.
+
+Resolution, done by hand rather than trusting the auto-merge:
+1. For the two conflicting files, kept **this session's structure** as the
+   base (`git checkout --ours`) — it's the more general one (strategy-generic
+   loop) and already had test coverage (`test_dashboard_renders.py`,
+   `test_settings_persist.py`).
+2. Read `cfabc94`'s full diff first, then **manually re-applied every
+   genuinely new capability** on top of that base — not merged, ported:
+   - `_in_news_blackout()` / `_bar_age_seconds()` helpers, verbatim
+   - **circuit-breaker state now survives an engine restart** — consecutive
+     losses and the day's P&L are saved to `settings["cb_state"]` after every
+     closed trade and restored on startup if it's still the same UTC day.
+     Neither this session's work nor the prior 2026-09-01/02 handoffs had this;
+     it closes a real hole (a losing streak split across a restart never
+     tripped the breaker).
+   - max-spread gate and stale-feed gate, as two new shields in the per-bar
+     loop, reading `risk.max_spread_usd` / `risk.stale_bar_secs`
+   - a **manual** `"HH:MM-HH:MM"` UTC news-window list
+     (`risk.news_blackout_windows`) — supplements, does not replace, this
+     session's ForexFactory-driven automatic `NewsFilter`
+   - per-fill spread/slippage/latency now logged and stored on every trade
+     (`MT5Bridge.last_exec`, unchanged from `cfabc94`)
+   - the new sidebar knobs (Max Spread, Stale-Feed Halt, Manual News Windows)
+     were added via **this session's** `_persisted_number` /
+     `_persisted_text_list` pattern, not `cfabc94`'s `bot_config` dict — so the
+     merged codebase has **one** settings scheme, not two
+   - trade-history R-multiple is now computed live from entry/SL/pnl (the
+     stored `pnl_r_multiple` column is 0 outside the backtester)
+3. `tests/test_exec_safety.py` (8 cases, from `cfabc94`) merged in and **passes
+   unmodified** against the reconciled file — `_in_news_blackout` /
+   `_bar_age_seconds` kept their exact names and signatures on purpose so this
+   wouldn't need touching.
+4. Committed as a real two-parent merge commit (`d314298`), not a rebase or a
+   force-push — `git log -1 --format="%P"` on it shows both `0b8b6df` and
+   `cfabc94` as parents. **Nothing from either side was discarded.**
+
+**A real bug surfaced while verifying the merge**, not by inspection but by
+actually stopping and restarting the stack: `stop_bot.ps1` didn't clear the
+SQLite `engine_heartbeat` setting when it killed the engine process. A
+heartbeat can read "fresh" (< 20s old) for a few seconds after the process is
+actually dead, so running `start_bot.ps1` right after `stop_bot.ps1` saw a
+still-fresh heartbeat and skipped restarting the engine — the exact "the merge
+is committed but the OLD process is still what's live" trap. Fixed:
+`stop_bot.ps1` now explicitly clears the heartbeat whenever it actually stops
+the engine. Verified by doing the stop → start cycle twice and confirming the
+engine.log timestamp and PID actually changed the second time.
+
+**If you're merging anything into `run_live_auto_bot.py` or `streamlit_app.py`
+again**: check `git log --all --oneline -- trading_bot/run_live_auto_bot.py`
+first. Both files are now flashpoints — general-purpose (strategy-agnostic)
+and actively being extended from more than one direction. A blind merge on
+either will conflict; read both diffs in full before resolving, the way this
+one was done.
 
 ## What exists now that didn't before
 

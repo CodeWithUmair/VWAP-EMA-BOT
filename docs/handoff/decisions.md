@@ -159,6 +159,41 @@ it's marked *(inferred)*. Correct these as you learn more.
   string to a native process's argv. Fixed by writing the one-liners to small
   files under `.run/` and invoking those instead.
 
+## Merge reconciliation with a concurrent push (2026-09-07, `d314298`)
+
+- **When two sessions fix the same bug independently, don't trust the
+  auto-merge — read both diffs first.** *(this session)* `origin/main` had
+  moved (`cfabc94`, another session, same day) with its own fix for "sidebar
+  config doesn't persist / engine doesn't read it" — a single `bot_config`
+  dict, incompatible with this session's `param.<strategy>.<key>` / `risk.*`
+  settings-table scheme. `git merge` did conflict in
+  `trading_bot/run_live_auto_bot.py` and `trading_bot/streamlit_app.py`
+  (auto-merged cleanly in `storage.py` / `mt5_bridge.py`, which were purely
+  additive on both sides). Resolved by keeping this session's structure as the
+  base and manually re-applying every genuinely new capability from the other
+  side on top of it — not a mechanical hunk-by-hunk merge. See the "Addendum"
+  in `sessions/2026-09-07-strategy-registry-crt-sweeps-news-filter.md` for the
+  full list of what was ported. Committed as a real two-parent merge
+  (`d314298`); nothing from either side was discarded, and full suite went
+  31 → 39 tests (the other session's `test_exec_safety.py` merged in and
+  passes unmodified).
+- **Circuit-breaker state now persists across an engine restart** (consec
+  losses, daily P&L, saved to `settings["cb_state"]` after every closed trade,
+  restored on startup if still the same UTC day) — this closes a hole flagged
+  in the *original* 2026-09-01 handoff ("Circuit-breaker state is per-process
+  and in-memory") that had gone unfixed through two more sessions. Came from
+  the merged-in `cfabc94`, not from this session's own work.
+- **`scripts/stop_bot.ps1` must clear the SQLite `engine_heartbeat` when it
+  stops the engine.** *(this session, found by actually restarting the stack,
+  not by code review)* A heartbeat can read "fresh" (< 20s old) for a few
+  seconds after the process that wrote it is already dead, so
+  `start_bot.ps1` run immediately after `stop_bot.ps1` would see a live-looking
+  heartbeat and skip restarting the engine — silently leaving the *old* code
+  running after what looked like a successful restart. This is exactly the
+  kind of bug that "looks done" from the logs alone; it only showed up by
+  doing the stop → start cycle twice and checking that the PID and log
+  timestamp actually changed the second time.
+
 ## This handoff session's own choices (2026-09-01)
 
 - **Added `docs/handoff/` only.** No bot code touched — the owner's explicit constraint.

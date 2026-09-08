@@ -162,7 +162,12 @@ From `d:/mine/Bots/VWAP-EMA-BOT`, using the venv:
     first if it's newer than what you already know.** Strategy registry, the CRT
     sweep strategy, news filter (no API key exists), balance-scaled risk, sidebar
     settings persistence, dashboard render tests, the one-command launcher. Also
-    where the "don't touch bot code" constraint from 2026-09-01 was lifted.
+    where the "don't touch bot code" constraint from 2026-09-01 was lifted. **Its
+    "Addendum" section records a same-day merge with a concurrent push
+    (`cfabc94`) that fixed the same sidebar-persistence bug independently, with
+    an incompatible design — read that before touching `run_live_auto_bot.py` or
+    `streamlit_app.py`, both of which are now actively extended from more than
+    one direction.**
 
 ## Not done yet / open questions for the next session
 
