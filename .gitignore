@@ -29,3 +29,8 @@ trading_bot_data.sqlite
 #   python -m trading_bot.news_filter
 data/*.csv
 data/news_events.json
+
+# PIDs/logs from scripts/start_bot.ps1 - local runtime state, not source.
+.run/
+# Claude Code local tool-permission cache — machine-specific, not project config.
+.claude/settings.json

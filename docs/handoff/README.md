@@ -9,17 +9,22 @@ made, and update the snapshot below.
 
 > This handoff was started 2026-09-01 by a Claude Code session working out of the
 > sibling repo `d:/mine/Bots/scalping_bot`, at the owner's request, right after this
-> repo was forked and cloned. The `docs/handoff/` tree is the only thing that session
-> added — **no file under `trading_bot/`, `src/`, `server.ts`, or the root was touched.**
-> The owner's instruction stands: this bot "is running amazingly" — don't refactor it,
-> don't rewrite its strategy. Add tooling and docs alongside it.
+> repo was forked and cloned. At that point the `docs/handoff/` tree was the only
+> thing touched, under an explicit "don't touch bot code" constraint.
+>
+> **That constraint no longer holds.** Starting 2026-09-07 the owner directly asked
+> for a second strategy inside `trading_bot/` (see
+> `sessions/2026-09-07-strategy-registry-crt-sweeps-news-filter.md` — read it before
+> assuming anything here is off-limits). `trading_bot/strategies/`, the backtester,
+> the live engine, and the dashboard were all extended in that session, with the
+> owner reviewing and testing each change.
 
 ## Project at a glance
 
 | | |
 |---|---|
 | **Repo** | `d:/mine/Bots/VWAP-EMA-BOT` — fork of `github.com/uzairshaikh346/VWAP-EMA-BOT`, owner's fork at `github.com/CodeWithUmair/VWAP-EMA-BOT`, branch `main` |
-| **What it is** | XAU/USD **M1 (1-minute)** scalping bot. 5-filter causal checklist, all must pass: session-anchored **VWAP** trend + **EMA 9/21** crossover + causal **order blocks / break-of-structure** + **pullback** to the EMAs + **candlestick** confirmation. Fixed **0.10 lot**, **RR 1:2**, SL placed behind the last 10 bars' low/high and clamped to $1–$8. |
+| **What it is** | Now **two selectable strategies** behind `trading_bot/strategies/` (`REGISTRY` in `strategies/__init__.py`), picked in the dashboard sidebar and by the headless engine: **(1)** the original XAU/USD **M1 scalper** — VWAP trend + EMA 9/21 crossover + causal order blocks/BOS + pullback + candlestick confirmation, all 5 must pass; RR now **1:2** (was 1:1.5, see decisions.md), SL clamped $1–$8. **(2)** **CRT + TBS "Body Soup"** — a swing/sweep strategy: marks a CRT range from the last completed H1/H4 candle, waits for a body-close liquidity trap + confirmation break, targets the range midpoint (TP1, half off) then the opposite side (TP2). Neither has a demonstrated edge on real data yet — see the 2026-09-07 session file. A third variant (wick-sweep CRT) exists in code but is **archived, not offered in the sidebar** — it lost money in every real-data test. |
 | **Stack** | Python 3.14 · own venv at `venv/` · pandas 3.0.5 · numpy 2.5.2 · streamlit 1.63 · MetaTrader5 5.0.6147 · scipy · plotly. **SQLite** (`trading_bot_data.sqlite`, committed, opened by *relative path* → lands in the working directory the bot is run from). No Postgres, no Docker. |
 | **Broker** | MetaTrader 5 terminal, **demo-only** (hard-enforced on every order via `account_info().trade_mode`). Symbol `XAUUSDm` (hardcoded in `run_live_auto_bot.py`). **Magic number `9212001`**. |
 | **Sibling repo** | `d:/mine/Bots/scalping_bot` — the owner's other, older bot (MACD scalp, Postgres, its own handoff). Uses magic `990101`. If both run at once they share the one MT5 terminal/account — see `MULTI-ACCOUNT.md`. |
@@ -83,27 +88,58 @@ made, and update the snapshot below.
 
 ## How to run
 
+### The whole bot, one command (added 2026-09-07)
+
+```powershell
+./scripts/start_bot.ps1                              # engine follows the sidebar's strategy
+./scripts/start_bot.ps1 -Strategy crt_body_soup       # pin a strategy instead
+./scripts/start_bot.ps1 -DashboardPort 8502           # scalping_bot usually holds 8501
+./scripts/stop_bot.ps1                                # stops dashboard + engine, leaves MT5 up
+./scripts/stop_bot.ps1 -Mt5Too                         # closes MT5 too
+```
+
+Brings up MT5 (`terminal64.exe`, if not already running), the dashboard, and
+the headless engine — checking each one's actual state (process name / port /
+SQLite heartbeat) rather than assuming, so running it twice never double-starts
+anything. PIDs and logs land in `.run/` (gitignored); `stop_bot.ps1` targets
+exactly those PIDs. If a stage fails to come up, read the matching log in
+`.run/` — the script prints which one.
+
+### Piece by piece
+
 From `d:/mine/Bots/VWAP-EMA-BOT`, using the venv:
 
 | goal | command |
 |---|---|
-| Unit tests | `./venv/Scripts/python trading_bot/run_tests.py` |
-| Backtest + noise gate (synthetic data) | `./venv/Scripts/python trading_bot/run_backtest.py` |
-| **Headless live auto-trader** | `set PYTHONUTF8=1` then `./venv/Scripts/python trading_bot/run_live_auto_bot.py` |
-| Dashboard (monitor + manual buttons) | `./venv/Scripts/streamlit run trading_bot/streamlit_app.py --server.port 8502` |
+| Unit tests (incl. dashboard render + settings persistence) | `./venv/Scripts/python trading_bot/run_tests.py` |
+| Backtest + noise gate, one strategy | `./venv/Scripts/python -m trading_bot.run_backtest --strategy crt_body_soup --real --bars 50000` |
+| Parameter sweep | `./venv/Scripts/python -m trading_bot.run_sweep --strategy crt_body_soup --real` |
+| Refresh the news calendar cache | `./venv/Scripts/python -m trading_bot.news_filter` |
+| Pull years of M1 history (broker only keeps ~3 months) | `./venv/Scripts/python scripts/fetch_dukascopy_m1.py --from 2026-01-01 --to 2026-09-06 --out data/XAUUSD_M1.csv` |
+| **Headless live auto-trader** (manual, not via the launcher) | `set PYTHONUTF8=1` then `./venv/Scripts/python -m trading_bot.run_live_auto_bot` |
+| Dashboard (manual, not via the launcher) | `./venv/Scripts/streamlit run trading_bot/streamlit_app.py --server.port 8502` |
 
 **Gotchas:**
-- **`PYTHONUTF8=1` is required for the headless runner** when stdout is not a real
-  console (a pipe, a log file, a background process). Without it, it crashes on the
-  first line — `UnicodeEncodeError: 'charmap' codec can't encode '\U0001f680'` (the 🚀
-  emoji) under Windows cp1252. `PYTHONIOENCODING=utf-8` works too. This is an env var,
-  not a code change — the owner asked that the bot's code not be edited.
+- **`PYTHONUTF8=1` / `set_stream.reconfigure`** — the headless runner logs with emoji
+  and crashes under Windows cp1252 the moment stdout isn't a real console (a pipe, a
+  log file, `start_bot.ps1`'s redirected output). `run_live_auto_bot.py` now forces
+  UTF-8 on `sys.stdout`/`sys.stderr` at import time (2026-09-07), so this is handled in
+  code now — `PYTHONUTF8=1` is a harmless belt-and-braces, not required any more.
 - **Port 8501** is normally taken by `scalping_bot`'s dashboard — pass
-  `--server.port 8502` (or Streamlit will bump it itself).
+  `-DashboardPort 8502` to the launcher (or `--server.port 8502` if running Streamlit
+  by hand).
 - MT5 terminal must be **running and logged in**, with **Allow Algo Trading** on
-  (`Tools → Options → Expert Advisors`).
-- The live runner has **no "arm" switch** — it places a real (demo) 0.10-lot order the
-  moment all 5 filters pass. It sleeps 60 s after each fill. `Ctrl-C` to stop.
+  (`Tools → Options → Expert Advisors`) — `start_bot.ps1` launches the terminal if it
+  isn't running, but it can't log in for you on first use.
+- The live runner has **no "arm" switch** — it places a real (demo) order the moment
+  every filter for the selected strategy passes. Position size is a fixed 0.01 lots.
+  `Ctrl-C` to stop, or `./scripts/stop_bot.ps1` if launched via the script.
+- **Sidebar settings now persist and reach the engine** (2026-09-07) — Max Daily Loss,
+  Max Consec Losses, Magic Number, and every strategy parameter round-trip through
+  SQLite (`param.<strategy>.<key>` / `risk.*`). Before that commit only the strategy
+  picker survived a refresh; everything else silently reverted to hardcoded defaults
+  and the engine never read the dashboard's values at all. If a sidebar change
+  doesn't seem to be taking effect on a very old checkout, that's why — update.
 
 ## Index
 
@@ -122,20 +158,31 @@ From `d:/mine/Bots/VWAP-EMA-BOT`, using the venv:
   - `2026-09-02-dashboard-ui-heartbeat-and-sync.md` — upstream sync (friend's
     single-position/break-even runner), engine heartbeat, full dashboard restyle +
     AUTO-ENGINE indicator + Trade History table. Commit `f8074da` (unpushed).
+  - **`2026-09-07-strategy-registry-crt-sweeps-news-filter.md`** — **read this one
+    first if it's newer than what you already know.** Strategy registry, the CRT
+    sweep strategy, news filter (no API key exists), balance-scaled risk, sidebar
+    settings persistence, dashboard render tests, the one-command launcher. Also
+    where the "don't touch bot code" constraint from 2026-09-01 was lifted.
 
 ## Not done yet / open questions for the next session
 
+- **Neither strategy has a demonstrated edge on real data** (as of 2026-09-07) — the
+  scalper is roughly break-even after costs, the sweep loses more often than not
+  across independent test windows. The owner's agreed next step is forward-testing on
+  the $100 demo before any real deposit. See the 2026-09-07 session file for the full
+  backtest results and why the numbers don't fully agree with each other yet.
+- **$100 demo balance is too small for the sweep strategy at the broker's 0.01-lot
+  minimum** — a single stop can be up to 12% of the account. Flagged loudly at every
+  engine startup (`SIZING WARNING`), not silently worked around.
 - **Multi-account concurrency isn't solved yet** — see `MULTI-ACCOUNT.md`. Decide:
   wrapper launcher vs. separate MT5 installs vs. sequential.
-- **No real-data backtest.** Everything measured here is on the synthetic feed. If you
-  want an honest read on edge, wire `run_backtest.py` / a new script to real MT5 M1
-  history (the sibling `scalping_bot/scalping_bot/data/mt5_source.py` is a working
-  reference for pulling and caching broker candles — copy the pattern, don't import
-  across repos).
-- **Circuit-breaker state is per-process and in-memory** — restart the live runner and
-  its daily-loss / consecutive-loss counters reset to zero. If that matters, it needs
-  persisting (SQLite tables already exist for it in `storage.py`; the wiring in
-  `run_live_auto_bot.py` doesn't load them back).
+- **Circuit-breaker state is still per-process and in-memory** — restart the live
+  runner (including via `start_bot.ps1`) and its daily-loss / consecutive-loss
+  counters reset to zero. Flagged in the 2026-09-01 handoff too; still true.
 - **`get_closed_deals` in the live loop isn't magic-filtered** — when this bot and
   `scalping_bot` share one account, this bot's circuit-breaker P&L tally can pick up
   the *other* bot's closed deals. Cosmetic on demo; worth knowing.
+- **`.run/`'s PID tracking has no supervisor** — if the engine crashes mid-session,
+  nothing restarts it automatically; `start_bot.ps1` only checks state when you run
+  it. Fine for now since the owner is actively forward-testing and watching the
+  dashboard; would need a watch/auto-restart mode for unattended runs.
